@@ -1,0 +1,6 @@
+# Solr data
+solr/data/
+solr/logs/
+
+# Docker volumes
+docker-volumes/

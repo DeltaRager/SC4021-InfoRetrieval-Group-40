@@ -1,0 +1,17 @@
+version: "3.8"
+services:
+  solr:
+    image: solr:10.0.0
+    container_name: opinion_solr
+    ports:
+      - "8983:8983"
+    volumes:
+      - solr_data:/var/solr
+      - ./solr/configs:/configs
+    command: >
+      solr-precreate opinions_core /configs
+    environment:
+      - SOLR_HEAP=512m
+
+volumes:
+  solr_data:

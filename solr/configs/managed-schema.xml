@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<schema name="opinions" version="1.6">
+
+  <field name="id"        type="string"  indexed="true" stored="true" required="true"/>
+  <field name="text"      type="text_en" indexed="true" stored="true"/>
+  <field name="timestamp" type="pdate"   indexed="true" stored="true"/>
+  <field name="_text_"    type="text_en" indexed="true" stored="false" multiValued="true"/>
+  <field name="_version_" type="plong"   indexed="false" stored="false"/>
+
+  <uniqueKey>id</uniqueKey>
+  <copyField source="text" dest="_text_"/>
+
+  <fieldType name="string"  class="solr.StrField"       sortMissingLast="true" docValues="true"/>
+  <fieldType name="plong"   class="solr.LongPointField"  docValues="true"/>
+  <fieldType name="pdate"   class="solr.DatePointField"  docValues="true"/>
+  <fieldType name="text_en" class="solr.TextField" positionIncrementGap="100">
+    <analyzer>
+      <tokenizer class="solr.StandardTokenizerFactory"/>
+      <filter class="solr.LowerCaseFilterFactory"/>
+      <filter class="solr.StopFilterFactory" words="lang/stopwords_en.txt" ignoreCase="true"/>
+      <filter class="solr.EnglishMinimalStemFilterFactory"/>
+    </analyzer>
+  </fieldType>
+
+</schema>
