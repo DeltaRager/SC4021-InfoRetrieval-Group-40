@@ -4,3 +4,6 @@ solr/logs/
 
 # Docker volumes
 docker-volumes/
+
+# Text files
+pdf_text.txt
