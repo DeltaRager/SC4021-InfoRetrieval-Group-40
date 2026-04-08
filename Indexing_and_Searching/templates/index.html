@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Reddit AI Search</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; }
+    .filters { display: grid; grid-template-columns: repeat(6, minmax(120px,1fr)); gap: 8px; margin-bottom: 12px; }
+    input, select, button { padding: 8px; }
+    .meta { color: #555; margin: 8px 0 16px; }
+    .result { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    .tags { font-size: 0.9em; color: #333; margin-bottom: 8px; }
+    mark { background: #ffe082; }
+    .facet { background: #f8f8f8; padding: 8px; margin: 12px 0; border-radius: 6px; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>Reddit AI Search (Solr)</h1>
+  <form method="get">
+    <input name="q" placeholder="Search full text (e.g., prompt injection)" value="{{ q }}" style="width:100%; margin-bottom: 8px;" />
+    <div class="filters">
+      <select name="type">
+        <option value="">All types</option>
+        <option value="post" {% if doc_type == 'post' %}selected{% endif %}>Post</option>
+        <option value="comment" {% if doc_type == 'comment' %}selected{% endif %}>Comment</option>
+      </select>
+      <input name="subreddit" placeholder="Subreddit" value="{{ subreddit }}" />
+      <input type="date" name="date_from" value="{{ date_from }}" />
+      <input type="date" name="date_to" value="{{ date_to }}" />
+      <select name="sort">
+        <option value="score desc" {% if sort == 'score desc' %}selected{% endif %}>Top score</option>
+        <option value="created_date desc" {% if sort == 'created_date desc' %}selected{% endif %}>Newest</option>
+      </select>
+      <button type="submit">Search</button>
+    </div>
+  </form>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {% if response_ms is not none %}
+    <div class="meta">Found <b>{{ num_found }}</b> results in <b>{{ response_ms }} ms</b>.</div>
+  {% endif %}
+
+  {% if facets %}
+    <div class="facet">
+      <b>Facets</b><br/>
+      Type: {{ facets.get('type', []) }}<br/>
+      Subreddit: {{ facets.get('subreddit', []) }}
+    </div>
+  {% endif %}
+
+  {% for r in results %}
+    <div class="result">
+      <div class="tags">{{ r.type }} · r/{{ r.subreddit }} · score={{ r.score }} · {{ r.created_date }}</div>
+      <div>{{ r.snippet|safe }}</div>
+    </div>
+  {% endfor %}
+</body>
+</html>
