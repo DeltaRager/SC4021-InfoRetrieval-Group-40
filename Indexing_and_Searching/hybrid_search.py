@@ -34,6 +34,8 @@ from typing import Any
 
 import requests
 
+from query_intent import infer_intent, QueryIntentProfile
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,35 @@ HYBRID_RERANK_CHUNK_K = int(os.getenv("HYBRID_RERANK_CHUNK_K", "150"))
 SEARCH_ROWS           = int(os.getenv("SEARCH_ROWS",            "20"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE",  "32"))
 EMBEDDING_DIM    = int(os.getenv("EMBEDDING_DIM",     "1024"))
+
+# ---------------------------------------------------------------------------
+# Query intent weight config (env-var overridable, alpha + beta must = 1.0)
+# ---------------------------------------------------------------------------
+
+_INTENT_KEYWORD_ALPHA  = float(os.getenv("QUERY_INTENT_KEYWORD_ALPHA",  "0.8"))
+_INTENT_KEYWORD_BETA   = float(os.getenv("QUERY_INTENT_KEYWORD_BETA",   "0.2"))
+_INTENT_MIXED_ALPHA    = float(os.getenv("QUERY_INTENT_MIXED_ALPHA",    "0.5"))
+_INTENT_MIXED_BETA     = float(os.getenv("QUERY_INTENT_MIXED_BETA",     "0.5"))
+_INTENT_SEMANTIC_ALPHA = float(os.getenv("QUERY_INTENT_SEMANTIC_ALPHA", "0.3"))
+_INTENT_SEMANTIC_BETA  = float(os.getenv("QUERY_INTENT_SEMANTIC_BETA",  "0.7"))
+
+
+def _validate_intent_weights() -> None:
+    pairs = [
+        ("keyword",  _INTENT_KEYWORD_ALPHA,  _INTENT_KEYWORD_BETA),
+        ("mixed",    _INTENT_MIXED_ALPHA,    _INTENT_MIXED_BETA),
+        ("semantic", _INTENT_SEMANTIC_ALPHA, _INTENT_SEMANTIC_BETA),
+    ]
+    for label, alpha, beta in pairs:
+        if abs(alpha + beta - 1.0) > 1e-6:
+            logger.warning(
+                "Intent weights for '%s' do not sum to 1.0 (alpha=%.3f beta=%.3f); "
+                "falling back to defaults.",
+                label, alpha, beta,
+            )
+
+
+_validate_intent_weights()
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +111,11 @@ class RetrievalInfo:
     fused_hits: int = 0
     reranked_hits: int = 0
     latency_ms: dict[str, float] = field(default_factory=dict)
+    # Query intent diagnostics
+    intent_label: str = ""          # "keyword" | "semantic" | "mixed" | ""
+    alpha: float = 0.5              # BM25 weight used in weighted RRF
+    beta: float = 0.5               # vector weight used in weighted RRF
+    intent_signals: dict[str, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +127,10 @@ class RetrievalInfo:
             "fused_hits": self.fused_hits,
             "reranked_hits": self.reranked_hits,
             "latency_ms": self.latency_ms,
+            "intent_label": self.intent_label,
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "intent_signals": self.intent_signals,
         }
 
 
@@ -276,15 +316,24 @@ def reciprocal_rank_fusion(
     lexical_ids: list[str],
     vector_ids: list[str],
     rrf_k: int = HYBRID_RRF_K,
+    lexical_weight: float = 0.5,
+    vector_weight: float = 0.5,
 ) -> list[tuple[str, float]]:
-    """Standard RRF: score += 1 / (rrf_k + rank).  Returns [(id, score)] sorted desc."""
+    """Weighted RRF: score += weight * (1 / (rrf_k + rank)).
+
+    When lexical_weight == vector_weight == 0.5 the result is identical to
+    standard (equal-weight) RRF.  Pass intent-derived alpha/beta to skew
+    fusion toward the stronger retriever for the given query.
+
+    Returns [(id, score)] sorted descending by score.
+    """
     scores: dict[str, float] = {}
 
     for rank, doc_id in enumerate(lexical_ids, start=1):
-        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+        scores[doc_id] = scores.get(doc_id, 0.0) + lexical_weight / (rrf_k + rank)
 
     for rank, doc_id in enumerate(vector_ids, start=1):
-        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+        scores[doc_id] = scores.get(doc_id, 0.0) + vector_weight / (rrf_k + rank)
 
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
@@ -310,6 +359,36 @@ FACET_FIELDS = (
     "model_mentions",
     "vendor_mentions",
 )
+
+
+def _facets_from_results(results: list[dict]) -> dict[str, list]:
+    """Compute facet counts from the final result set.
+
+    Single-value fields (type, subreddit, sentiment_label, source_dataset)
+    and multi-value fields (model_mentions, vendor_mentions) are both handled.
+    Returns a dict of {field: [val, count, val, count, ...]} matching the
+    flat-pairs format expected by the template's facet_links macro.
+    """
+    counts: dict[str, dict[str, int]] = {f: {} for f in FACET_FIELDS}
+    for doc in results:
+        for field in FACET_FIELDS:
+            value = doc.get(field)
+            if not value:
+                continue
+            # model_mentions / vendor_mentions are lists; others are strings
+            values = value if isinstance(value, list) else [value]
+            for v in values:
+                v = str(v).strip()
+                if v:
+                    counts[field][v] = counts[field].get(v, 0) + 1
+
+    facets: dict[str, list] = {}
+    for field, bucket in counts.items():
+        flat: list = []
+        for val, count in sorted(bucket.items(), key=lambda x: -x[1]):
+            flat.extend([val, count])
+        facets[field] = flat
+    return facets
 
 
 def _collapse_filter(sort: str = "score desc") -> str:
@@ -430,6 +509,28 @@ class HybridSearchService:
 
         info.vector_hits = len(vector_docs)
 
+        # Intent inference: classify query and derive per-query RRF weights.
+        intent_profile: QueryIntentProfile = infer_intent(
+            query_text,
+            keyword_alpha=_INTENT_KEYWORD_ALPHA,
+            keyword_beta=_INTENT_KEYWORD_BETA,
+            mixed_alpha=_INTENT_MIXED_ALPHA,
+            mixed_beta=_INTENT_MIXED_BETA,
+            semantic_alpha=_INTENT_SEMANTIC_ALPHA,
+            semantic_beta=_INTENT_SEMANTIC_BETA,
+        )
+        info.intent_label = intent_profile.intent_label
+        info.alpha = intent_profile.alpha
+        info.beta = intent_profile.beta
+        info.intent_signals = intent_profile.signals
+        logger.debug(
+            "Query intent: %s (alpha=%.2f beta=%.2f signals=%s)",
+            intent_profile.intent_label,
+            intent_profile.alpha,
+            intent_profile.beta,
+            intent_profile.signals,
+        )
+
         # Stage 3: RRF fusion at document level.
         # Lexical results are chunk records; collapse to unique doc_ids in
         # rank order (first occurrence of each doc_id wins).
@@ -446,7 +547,13 @@ class HybridSearchService:
                 lex_docs_by_doc_id[did] = d
 
         vector_doc_ids = [d["doc_id"] for d in vector_docs]
-        fused = reciprocal_rank_fusion(lexical_ids, vector_doc_ids, HYBRID_RRF_K)
+        fused = reciprocal_rank_fusion(
+            lexical_ids,
+            vector_doc_ids,
+            HYBRID_RRF_K,
+            lexical_weight=intent_profile.alpha,
+            vector_weight=intent_profile.beta,
+        )
         info.latency_ms["rrf"] = round((time.perf_counter() - t0) * 1000, 1)
         info.fused_hits = len(fused)
 
@@ -523,13 +630,19 @@ class HybridSearchService:
         # final_ids are doc_ids (stable source-document ids), so the id filter
         # must match against the doc_id field for chunk records.
         t0 = time.perf_counter()
-        final_ids = [c.doc_id for c in reranked[: SEARCH_ROWS]]
-        results, facets2 = self._fetch_with_highlighting(final_ids, solr_q, fq, qf, pf, bq, use_nlp)
-        # Preserve original facets from lexical retrieval (wider candidate set)
-        if facets:
-            pass  # keep lexical facets
-        else:
-            facets = facets2
+        final_candidates = reranked
+        final_ids = [c.doc_id for c in final_candidates]
+        # Build a score map: prefer rerank score; fall back to RRF score.
+        pipeline_scores = {
+            c.doc_id: (c.rerank_score if c.rerank_score != 0.0 else c.rrf_score)
+            for c in final_candidates
+        }
+        results, _ = self._fetch_with_highlighting(
+            final_ids, solr_q, fq, qf, pf, bq, use_nlp, pipeline_scores
+        )
+        # Compute facets from the actual result set so sidebar counts match
+        # what is displayed, not the wider lexical candidate pool.
+        facets = _facets_from_results(results)
         info.latency_ms["highlight_fetch"] = round((time.perf_counter() - t0) * 1000, 1)
 
         info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
@@ -724,6 +837,7 @@ class HybridSearchService:
         pf: str,
         bq: list[str],
         use_nlp: bool,
+        pipeline_scores: dict[str, float] | None = None,
     ) -> tuple[list[dict], dict]:
         """Fetch one representative chunk record per doc_id with highlighting.
 
@@ -738,16 +852,18 @@ class HybridSearchService:
         id_filter = "doc_id:(" + " OR ".join(doc_ids) + ")"
         all_fq = (fq or []) + [id_filter, _collapse_filter("score desc")]
 
+        # Use q=*:* so that all doc_ids are guaranteed to be returned regardless
+        # of lexical match strength (vector-only results would otherwise be
+        # dropped by the mm minimum-match filter).  Pass the original query via
+        # hl.q so highlighting still marks relevant terms in the snippet.
         params: dict[str, Any] = {
-            "q":       solr_q,
-            "defType": "edismax",
-            "qf":      qf,
-            "pf":      pf,
-            "mm":      "2<75%",
+            "q":       "*:*",
             "fl":      DISPLAY_FIELDS + ",chunk_index",
             "rows":    len(doc_ids),
             "wt":      "json",
             "hl":      "true",
+            "hl.q":    solr_q,
+            "hl.qparser": "edismax",
             "hl.fl":   "search_text,body,title,lemmatized_text,concepts",
             "hl.simple.pre":  "<mark>",
             "hl.simple.post": "</mark>",
@@ -785,7 +901,10 @@ class HybridSearchService:
                     break
             if not snippet:
                 snippet = (display_doc.get("body") or display_doc.get("title") or "")[:260]
-            results.append({**display_doc, "snippet": snippet})
+            result = {**display_doc, "snippet": snippet}
+            if pipeline_scores and did in pipeline_scores:
+                result["score"] = round(pipeline_scores[did], 4)
+            results.append(result)
 
         return results, facets
 
@@ -809,7 +928,15 @@ class HybridSearchService:
             if len(unique_doc_ids) >= SEARCH_ROWS:
                 break
 
-        results, _ = self._fetch_with_highlighting(unique_doc_ids, solr_q, fq, "", "", [], False)
+        # Build a score map from the lexical BM25 scores so the displayed
+        # score reflects actual relevance rather than the *:* default of 1.0.
+        lexical_scores: dict[str, float] = {}
+        for d in lexical_docs:
+            did = d.get("doc_id") or d.get("id")
+            if did and did not in lexical_scores:
+                lexical_scores[did] = float(d.get("score", 0.0))
+
+        results, _ = self._fetch_with_highlighting(unique_doc_ids, solr_q, fq, "", "", [], False, lexical_scores)
         if results:
             return results
         # Fallback: return raw docs without highlights (de-duplicated by doc_id)

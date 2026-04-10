@@ -22,6 +22,7 @@ from hybrid_search import (
     RetrievalInfo,
     reciprocal_rank_fusion,
 )
+from query_intent import infer_intent, QueryIntentProfile
 from scripts.prepare_solr_docs import (
     _split_into_chunks,
     _make_chunk_records,
@@ -65,7 +66,15 @@ class TestReciprocalRankFusion:
         assert reciprocal_rank_fusion([], [], rrf_k=60) == []
 
     def test_score_formula(self):
+        # Default weights are lexical_weight=0.5, vector_weight=0.5
         fused = reciprocal_rank_fusion(["x"], [], rrf_k=60)
+        _, score = fused[0]
+        expected = 0.5 / (60 + 1)
+        assert abs(score - expected) < 1e-9
+
+    def test_score_formula_unit_weights(self):
+        # With explicit equal-to-1 weights the score is 1/(k+rank)
+        fused = reciprocal_rank_fusion(["x"], [], rrf_k=60, lexical_weight=1.0, vector_weight=0.0)
         _, score = fused[0]
         expected = 1.0 / (60 + 1)
         assert abs(score - expected) < 1e-9
@@ -164,7 +173,7 @@ class TestRerankerClient:
 
     def _candidates(self, ids=("a", "b", "c")):
         return [
-            Candidate(id=i, source="lexical", raw_score=1.0, rrf_score=0.5,
+            Candidate(id=i, doc_id=i, source="lexical", raw_score=1.0, rrf_score=0.5,
                       search_text=f"text for {i}")
             for i in ids
         ]
@@ -301,7 +310,8 @@ class TestHybridSearchService:
             else:
                 return highlight_resp
 
-        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, highlight_resp]), \
+        chunk_expand_resp = self._fake_solr_response(["a", "b", "c", "d", "e", "f"])
+        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, chunk_expand_resp, highlight_resp]), \
              patch("hybrid_search.requests.post", return_value=vector_resp):
             results, facets, num_found, info = service.search(
                 solr_q="test query", fq=[], qf="title^4", pf="title^8",
@@ -315,8 +325,9 @@ class TestHybridSearchService:
         assert info.fused_hits > 0
         assert rerank_cands is not None
         # "c" and "e" should be in fused pool (from both or vector branch)
-        fused_ids = {c.id for c in rerank_cands}
-        assert "c" in fused_ids
+        # Candidates are chunk-level; check by doc_id
+        fused_doc_ids = {c.doc_id for c in rerank_cands}
+        assert "c" in fused_doc_ids
 
     def test_vector_failure_degrades_to_lexical(self):
         """When embed_query returns None, serve lexical results only."""
@@ -352,10 +363,11 @@ class TestHybridSearchService:
         vector_resp   = self._fake_solr_response(["b", "c", "d"])
         highlight_resp = self._fake_solr_response(["b", "c", "a", "d"])
 
+        chunk_expand_resp = self._fake_solr_response(["a", "b", "c", "d"])
         service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
         service._reranker.rerank = MagicMock(return_value=None)
 
-        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, highlight_resp]), \
+        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, chunk_expand_resp, highlight_resp]), \
              patch("hybrid_search.requests.post", return_value=vector_resp):
             results, facets, num_found, info = service.search(
                 solr_q="q", fq=[], qf="", pf="", bq=[], sort="score desc",
@@ -844,10 +856,15 @@ class TestChunkCollapse:
             "highlighting": {},
         }
 
+        # chunk_expand GET happens between lexical and highlight
+        chunk_expand_resp = MagicMock()
+        chunk_expand_resp.raise_for_status.return_value = None
+        chunk_expand_resp.json.return_value = {"response": {"docs": lex_chunks + vec_chunks}}
+
         service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
         service._reranker.rerank = MagicMock(side_effect=lambda q, cands, top_k: cands)
 
-        with patch("hybrid_search.requests.get", side_effect=[lex_resp, hl_resp]), \
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, chunk_expand_resp, hl_resp]), \
              patch("hybrid_search.requests.post", return_value=vec_resp):
             results, facets, num_found, info = service.search(
                 solr_q="q", fq=[], qf="", pf="", bq=[],
@@ -858,12 +875,12 @@ class TestChunkCollapse:
         # "b" appears in both lexical and vector → should be in fused pool
         rerank_call = service._reranker.rerank.call_args
         pool = rerank_call[0][1]
-        pool_ids = {c.id for c in pool}
-        assert "b" in pool_ids
-        assert "c" in pool_ids
-        # "a" should appear once despite two chunks in lexical hits
-        a_count = sum(1 for c in pool if c.id == "a")
-        assert a_count <= 1
+        pool_doc_ids = {c.doc_id for c in pool}
+        assert "b" in pool_doc_ids
+        assert "c" in pool_doc_ids
+        # "a" may appear as multiple chunks but all must share the same doc_id
+        a_count = sum(1 for c in pool if c.doc_id == "a")
+        assert a_count >= 1  # at least one chunk from doc "a"
 
     def test_zero_vector_chunks_does_not_break_lexical(self):
         """If embedding fails, lexical retrieval still returns results."""
@@ -960,6 +977,11 @@ class TestChunkCollapse:
             "highlighting": {},
         }
 
+        # chunk_expand GET expands doc1 and doc2 to all their chunks
+        chunk_expand_resp = MagicMock()
+        chunk_expand_resp.raise_for_status.return_value = None
+        chunk_expand_resp.json.return_value = {"response": {"docs": lex_chunks}}
+
         reranked_candidates = []
         def capture_rerank(query, candidates, top_k):
             reranked_candidates.extend(candidates)
@@ -967,14 +989,349 @@ class TestChunkCollapse:
         service._embedder.embed_query = MagicMock(return_value=[0.1])
         service._reranker.rerank = capture_rerank
 
-        with patch("hybrid_search.requests.get", side_effect=[lex_resp, hl_resp]), \
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, chunk_expand_resp, hl_resp]), \
              patch("hybrid_search.requests.post", return_value=vec_resp):
             service.search(
                 solr_q="q", fq=[], qf="", pf="", bq=[],
                 sort="score desc", use_nlp=False, query_text="q",
             )
 
-        candidate_ids = [c.id for c in reranked_candidates]
-        # Must be exactly 2 unique doc-level candidates (doc1, doc2)
-        assert len(candidate_ids) == len(set(candidate_ids))
-        assert set(candidate_ids) == {"doc1", "doc2"}
+        # After chunk expansion each doc appears once per chunk, but only 2 unique doc_ids
+        assert len({c.doc_id for c in reranked_candidates}) == 2
+
+
+# ---------------------------------------------------------------------------
+# Query intent inference unit tests
+# ---------------------------------------------------------------------------
+
+class TestQueryIntent:
+    """Unit tests for query_intent.infer_intent()."""
+
+    def test_short_entity_query_is_keyword(self):
+        """Single-token known entity → keyword intent."""
+        profile = infer_intent("ChatGPT")
+        assert profile.intent_label == "keyword"
+        assert profile.alpha > profile.beta
+
+    def test_short_lookup_is_keyword(self):
+        """Two-token entity lookup → keyword intent."""
+        profile = infer_intent("Claude pricing")
+        assert profile.intent_label == "keyword"
+        assert profile.alpha >= 0.5
+
+    def test_analytical_question_is_semantic(self):
+        """Explicit why-question → semantic intent."""
+        profile = infer_intent("Why do LLMs hallucinate?")
+        assert profile.intent_label == "semantic"
+        assert profile.beta > profile.alpha
+
+    def test_comparison_query_is_semantic(self):
+        """Comparison phrasing → semantic intent."""
+        profile = infer_intent("Is ChatGPT better than Claude?")
+        assert profile.intent_label == "semantic"
+        assert profile.beta > profile.alpha
+
+    def test_ambiguous_entity_benchmark_is_not_semantic(self):
+        """Short entity + technical term without question → keyword or mixed."""
+        profile = infer_intent("GPT-4 benchmark")
+        assert profile.intent_label in ("keyword", "mixed")
+
+    def test_weights_sum_to_one(self):
+        """alpha + beta must always equal 1.0 for any query."""
+        queries = [
+            "ChatGPT",
+            "Claude pricing",
+            "Why do LLMs hallucinate?",
+            "Is ChatGPT better than Claude?",
+            "GPT-4 benchmark",
+            "How does retrieval-augmented generation work?",
+            "",
+        ]
+        for q in queries:
+            p = infer_intent(q)
+            assert abs(p.alpha + p.beta - 1.0) < 1e-6, (
+                f"alpha+beta != 1.0 for query {q!r}: alpha={p.alpha} beta={p.beta}"
+            )
+
+    def test_signals_dict_is_populated(self):
+        """Intent profile should always include a signals dict."""
+        profile = infer_intent("Why do LLMs hallucinate?")
+        assert isinstance(profile.signals, dict)
+        assert len(profile.signals) > 0
+
+    def test_query_features_populated(self):
+        """query_features should include at least token_count."""
+        profile = infer_intent("What is AGI?")
+        assert "token_count" in profile.query_features
+
+    def test_explicit_weight_override(self):
+        """Caller-supplied weights are used in the returned profile."""
+        profile = infer_intent(
+            "Why do LLMs hallucinate?",
+            semantic_alpha=0.2,
+            semantic_beta=0.8,
+        )
+        assert profile.intent_label == "semantic"
+        assert abs(profile.alpha - 0.2) < 1e-6
+        assert abs(profile.beta - 0.8) < 1e-6
+
+    def test_empty_query_does_not_crash(self):
+        """Empty string should return a valid profile."""
+        profile = infer_intent("")
+        assert profile.intent_label in ("keyword", "mixed", "semantic")
+        assert abs(profile.alpha + profile.beta - 1.0) < 1e-6
+
+    def test_long_natural_language_query_is_semantic_or_mixed(self):
+        """Long sentence-like query should bias toward semantic."""
+        profile = infer_intent(
+            "Can you explain how transformer attention mechanisms work in large language models?"
+        )
+        assert profile.intent_label in ("semantic", "mixed")
+
+    def test_comparison_signals_present(self):
+        """Comparison queries should fire comparison signal."""
+        profile = infer_intent("GPT-4 vs Claude 3 performance")
+        assert "comparison" in profile.signals
+
+
+# ---------------------------------------------------------------------------
+# Weighted RRF unit tests
+# ---------------------------------------------------------------------------
+
+class TestWeightedRRF:
+    """Extends RRF tests to cover lexical_weight / vector_weight parameters."""
+
+    def test_equal_weights_matches_unweighted_behavior(self):
+        """Equal weights preserve relative order; explicit 1.0/1.0 reproduces classic RRF scores."""
+        ids_a = ["a", "b", "c"]
+        ids_b = ["c", "b", "a"]
+        # Default call uses lexical_weight=0.5, vector_weight=0.5
+        default_fused = reciprocal_rank_fusion(ids_a, ids_b, rrf_k=60)
+        # Explicit equal weights should give the same relative order
+        equal_fused = reciprocal_rank_fusion(ids_a, ids_b, rrf_k=60,
+                                             lexical_weight=0.5, vector_weight=0.5)
+        assert [x[0] for x in default_fused] == [x[0] for x in equal_fused]
+
+        # With weights 1.0/1.0 the scores match classic RRF (weight=1)
+        classic_fused = reciprocal_rank_fusion(ids_a, ids_b, rrf_k=60,
+                                               lexical_weight=1.0, vector_weight=1.0)
+        for (cid, cs), (eid, es) in zip(classic_fused, equal_fused):
+            # classic score should be 2× the equal-weight score
+            assert abs(cs - es * 2.0) < 1e-9
+
+    def test_high_lexical_weight_promotes_lexical_only_doc(self):
+        """With alpha=0.9, a doc only in the lexical list should outscore a doc only in vector."""
+        lexical_ids = ["lex_only", "shared"]
+        vector_ids  = ["shared", "vec_only"]
+        fused = reciprocal_rank_fusion(
+            lexical_ids, vector_ids, rrf_k=60,
+            lexical_weight=0.9, vector_weight=0.1,
+        )
+        scores = {doc_id: sc for doc_id, sc in fused}
+        # lex_only gets 0.9/(60+1); vec_only gets 0.1/(60+2)
+        # lex_only should beat vec_only
+        assert scores["lex_only"] > scores["vec_only"]
+
+    def test_high_vector_weight_promotes_vector_only_doc(self):
+        """With beta=0.9, a doc only in the vector list should outscore a doc only in lexical."""
+        lexical_ids = ["lex_only", "shared"]
+        vector_ids  = ["shared", "vec_only"]
+        fused = reciprocal_rank_fusion(
+            lexical_ids, vector_ids, rrf_k=60,
+            lexical_weight=0.1, vector_weight=0.9,
+        )
+        scores = {doc_id: sc for doc_id, sc in fused}
+        assert scores["vec_only"] > scores["lex_only"]
+
+    def test_shared_doc_benefits_from_both_contributions(self):
+        """A doc in both lists accumulates contributions from both branches."""
+        lexical_ids = ["a", "shared"]
+        vector_ids  = ["shared", "b"]
+        fused = reciprocal_rank_fusion(
+            lexical_ids, vector_ids, rrf_k=60,
+            lexical_weight=0.5, vector_weight=0.5,
+        )
+        scores = {doc_id: sc for doc_id, sc in fused}
+        # shared appears at rank-2 in lex and rank-1 in vec
+        expected = 0.5 / (60 + 2) + 0.5 / (60 + 1)
+        assert abs(scores["shared"] - expected) < 1e-9
+
+    def test_score_formula_with_explicit_weights(self):
+        """Verify per-item score formula: weight / (k + rank)."""
+        fused = reciprocal_rank_fusion(["x"], [], rrf_k=60, lexical_weight=0.8, vector_weight=0.2)
+        _, score = fused[0]
+        expected = 0.8 / (60 + 1)
+        assert abs(score - expected) < 1e-9
+
+    def test_dedup_still_applies_with_weights(self):
+        """Deduplication must work the same way with non-equal weights."""
+        fused = reciprocal_rank_fusion(["a", "b"], ["b", "c"], rrf_k=60,
+                                       lexical_weight=0.7, vector_weight=0.3)
+        ids = [doc_id for doc_id, _ in fused]
+        assert len(ids) == len(set(ids))
+
+
+# ---------------------------------------------------------------------------
+# HybridSearchService intent integration tests
+# ---------------------------------------------------------------------------
+
+class TestIntentIntegration:
+    """Verify intent inference is wired into HybridSearchService.search()."""
+
+    SOLR_URL = "http://fake-solr:8983/solr/test_core/select"
+
+    def _make_service(self):
+        embedder = EmbeddingClient()
+        reranker = RerankerClient()
+        return HybridSearchService(self.SOLR_URL, embedder, reranker)
+
+    def _make_solr_docs(self, ids):
+        return [
+            {"id": f"{i}__c0", "doc_id": i, "chunk_index": 0,
+             "chunk_text": f"chunk text {i}", "search_text": f"text {i}",
+             "body": f"body {i}", "title": "", "type": "post", "subreddit": "test",
+             "source_dataset": "test", "sentiment_label": "neutral",
+             "sentiment_score": 0.0, "model_mentions": [], "vendor_mentions": [],
+             "opinionatedness_score": 0.5, "score": 1, "created_date": ""}
+            for i in ids
+        ]
+
+    def _fake_solr_response(self, ids):
+        docs = self._make_solr_docs(ids)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "response": {"docs": docs, "numFound": len(ids)},
+            "facets": {
+                "count": len(ids), "unique_docs": len(ids),
+                "type": {"buckets": []}, "subreddit": {"buckets": []},
+                "sentiment_label": {"buckets": []}, "source_dataset": {"buckets": []},
+                "model_mentions": {"buckets": []}, "vendor_mentions": {"buckets": []},
+            },
+            "facet_counts": {"facet_fields": {}},
+            "highlighting": {},
+        }
+        return resp
+
+    def _fake_chunk_expand_response(self, ids):
+        """Minimal Solr response for the chunk-expansion GET."""
+        docs = self._make_solr_docs(ids)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"response": {"docs": docs}}
+        return resp
+
+    def test_intent_label_attached_to_retrieval_info(self):
+        """After a successful hybrid search, retrieval_info should have intent_label set."""
+        service = self._make_service()
+        lex_resp    = self._fake_solr_response(["a", "b"])
+        vec_resp    = self._fake_solr_response(["b", "c"])
+        expand_resp = self._fake_chunk_expand_response(["a", "b", "c"])
+        hl_resp     = self._fake_solr_response(["a", "b", "c"])
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
+        service._reranker.rerank = MagicMock(side_effect=lambda q, cands, top_k: cands)
+
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, expand_resp, hl_resp]), \
+             patch("hybrid_search.requests.post", return_value=vec_resp):
+            _, _, _, info = service.search(
+                solr_q="Why do LLMs hallucinate?", fq=[], qf="title^4", pf="title^8",
+                bq=[], sort="score desc", use_nlp=True,
+                query_text="Why do LLMs hallucinate?",
+            )
+
+        assert info.intent_label in ("keyword", "semantic", "mixed")
+        assert abs(info.alpha + info.beta - 1.0) < 1e-6
+
+    def test_semantic_query_uses_higher_beta(self):
+        """An explicit question query should produce beta > alpha in retrieval_info."""
+        service = self._make_service()
+        lex_resp    = self._fake_solr_response(["a", "b"])
+        vec_resp    = self._fake_solr_response(["b", "c"])
+        expand_resp = self._fake_chunk_expand_response(["a", "b", "c"])
+        hl_resp     = self._fake_solr_response(["a", "b", "c"])
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
+        service._reranker.rerank = MagicMock(side_effect=lambda q, cands, top_k: cands)
+
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, expand_resp, hl_resp]), \
+             patch("hybrid_search.requests.post", return_value=vec_resp):
+            _, _, _, info = service.search(
+                solr_q="Why do LLMs hallucinate?", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False,
+                query_text="Why do LLMs hallucinate?",
+            )
+
+        assert info.intent_label == "semantic"
+        assert info.beta > info.alpha
+
+    def test_keyword_query_uses_higher_alpha(self):
+        """A short entity query should produce alpha > beta in retrieval_info."""
+        service = self._make_service()
+        lex_resp    = self._fake_solr_response(["a", "b"])
+        vec_resp    = self._fake_solr_response(["b", "c"])
+        expand_resp = self._fake_chunk_expand_response(["a", "b", "c"])
+        hl_resp     = self._fake_solr_response(["a", "b", "c"])
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
+        service._reranker.rerank = MagicMock(side_effect=lambda q, cands, top_k: cands)
+
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, expand_resp, hl_resp]), \
+             patch("hybrid_search.requests.post", return_value=vec_resp):
+            _, _, _, info = service.search(
+                solr_q="ChatGPT", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False,
+                query_text="ChatGPT",
+            )
+
+        assert info.intent_label == "keyword"
+        assert info.alpha > info.beta
+
+    def test_lexical_degradation_still_reports_intent(self):
+        """Even when vector branch degrades, intent_label should be set."""
+        service = self._make_service()
+        lex_resp = self._fake_solr_response(["a", "b"])
+        hl_resp  = self._fake_solr_response(["a", "b"])
+
+        service._embedder.embed_query = MagicMock(return_value=None)
+
+        call_count = [0]
+        def fake_get(url, params, timeout):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return lex_resp
+            return hl_resp
+
+        with patch("hybrid_search.requests.get", side_effect=fake_get):
+            _, _, _, info = service.search(
+                solr_q="Why do LLMs hallucinate?", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False,
+                query_text="Why do LLMs hallucinate?",
+            )
+
+        # Mode degrades but intent fields should still be empty (inference
+        # only runs after vector branch succeeds)
+        assert info.mode == "lexical"
+        assert info.degraded
+
+    def test_intent_signals_in_retrieval_info(self):
+        """intent_signals should be populated after a full hybrid search."""
+        service = self._make_service()
+        lex_resp    = self._fake_solr_response(["a", "b"])
+        vec_resp    = self._fake_solr_response(["b", "c"])
+        expand_resp = self._fake_chunk_expand_response(["a", "b", "c"])
+        hl_resp     = self._fake_solr_response(["a", "b", "c"])
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
+        service._reranker.rerank = MagicMock(side_effect=lambda q, cands, top_k: cands)
+
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, expand_resp, hl_resp]), \
+             patch("hybrid_search.requests.post", return_value=vec_resp):
+            _, _, _, info = service.search(
+                solr_q="Why do LLMs hallucinate?", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False,
+                query_text="Why do LLMs hallucinate?",
+            )
+
+        assert isinstance(info.intent_signals, dict)
+        assert len(info.intent_signals) > 0

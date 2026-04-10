@@ -50,6 +50,9 @@
     .retrieval-badge.hybrid  { background: #dbeafe; color: #1d4ed8; }
     .retrieval-badge.lexical { background: #fef9c3; color: #854d0e; }
     .retrieval-badge.degraded { background: #fee2e2; color: #991b1b; }
+    .retrieval-badge.intent-keyword  { background: #ecfdf5; color: #065f46; }
+    .retrieval-badge.intent-semantic { background: #ede9fe; color: #5b21b6; }
+    .retrieval-badge.intent-mixed    { background: #fff3cd; color: #7c4a03; }
     .retrieval-stat { color: #6b7280; }
     .retrieval-stat b { color: #111827; }
   </style>
@@ -205,6 +208,10 @@
       {% endif %}
       {% if retrieval_info.reranked_hits %}
         <span class="retrieval-stat">Reranked: <b>{{ retrieval_info.reranked_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.intent_label %}
+        <span class="retrieval-badge intent-{{ retrieval_info.intent_label }}" title="Inferred query intent">{{ retrieval_info.intent_label | capitalize }}</span>
+        <span class="retrieval-stat" title="BM25 / vector fusion weights (weighted RRF)">α={{ '%.2f'|format(retrieval_info.alpha) }} β={{ '%.2f'|format(retrieval_info.beta) }}</span>
       {% endif %}
       {% set lms = retrieval_info.latency_ms %}
       {% if lms %}

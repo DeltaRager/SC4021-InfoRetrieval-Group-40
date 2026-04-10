@@ -328,6 +328,9 @@ def index() -> str:
             elapsed = (time.perf_counter() - start) * 1000
             response_ms = round(elapsed, 2)
             retrieval_info = info.as_dict()
+            # num_found from lexical retrieval reflects the candidate pool size,
+            # not the number of results shown (pipeline caps at SEARCH_ROWS=20).
+            num_found = len(results)
 
             # Surface any degradation warnings as the existing error banner
             if info.degraded and info.warnings:
