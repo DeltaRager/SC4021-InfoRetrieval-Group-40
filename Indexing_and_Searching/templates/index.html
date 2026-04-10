@@ -38,14 +38,35 @@
     .nlp-panel b { color: #2e7d32; }
     .nlp-label { display: inline-block; min-width: 140px; font-weight: 600; color: #555; }
     .concept-tag { display: inline-block; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 4px; padding: 2px 8px; margin: 2px 3px; font-size: 0.88em; color: #1565c0; }
+    .doc-concepts { margin-top: 6px; }
     .nlp-toggle { font-size: 0.88em; color: #666; margin-bottom: 10px; }
     .auto-corrected { background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.95em; color: #1565c0; }
     .auto-corrected .original { color: #999; text-decoration: line-through; }
     .auto-corrected .corrected { color: #2e7d32; font-weight: 600; }
     .auto-corrected .arrow { color: #888; margin: 0 4px; }
+    .retrieval-status { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.88em; color: #374151; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .retrieval-status.degraded { background: #fff7ed; border-color: #fed7aa; }
+    .retrieval-badge { padding: 2px 8px; border-radius: 12px; font-weight: 600; font-size: 0.82em; }
+    .retrieval-badge.hybrid  { background: #dbeafe; color: #1d4ed8; }
+    .retrieval-badge.lexical { background: #fef9c3; color: #854d0e; }
+    .retrieval-badge.degraded { background: #fee2e2; color: #991b1b; }
+    .retrieval-stat { color: #6b7280; }
+    .retrieval-stat b { color: #111827; }
   </style>
 </head>
 <body>
+  {% macro render_concept_chips(raw_concepts, limit=8) %}
+    {% if raw_concepts %}
+      {% set items = raw_concepts.split(' | ') if raw_concepts is string else raw_concepts %}
+      {% for concept in items[:limit] %}
+        {% set trimmed = concept|trim %}
+        {% if trimmed %}
+          <span class="concept-tag">{{ trimmed }}</span>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+  {% endmacro %}
+
   <h1>AI Opinion Search</h1>
   <form method="get">
     <div class="search-bar">
@@ -110,6 +131,13 @@
         Enable NLP enhancement (lemmatization, concept extraction, spell correction, prefix/wildcard)
       </label>
     </div>
+    <div class="nlp-toggle">
+      <label>
+        <input type="hidden" name="vector" value="0" />
+        <input type="checkbox" name="vector" value="1" {% if use_vector %}checked{% endif %} />
+        Enable vector search (semantic similarity via embeddings)
+      </label>
+    </div>
   </form>
 
   {% if error %}
@@ -151,9 +179,41 @@
       <span class="nlp-label">After stopword removal:</span> {{ nlp_info.cleaned }}<br/>
       {% if nlp_info.concepts %}
         <span class="nlp-label">Extracted concepts:</span>
-        {% for c in nlp_info.concepts[:8] %}
-          <span class="concept-tag">{{ c }}</span>
-        {% endfor %}
+        {{ render_concept_chips(nlp_info.concepts, 8) }}
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if retrieval_info %}
+    <div class="retrieval-status {% if retrieval_info.degraded %}degraded{% endif %}">
+      {% if retrieval_info.mode == 'hybrid' %}
+        <span class="retrieval-badge hybrid">Hybrid BM25 + Vector</span>
+      {% else %}
+        <span class="retrieval-badge lexical">Lexical BM25</span>
+      {% endif %}
+      {% if retrieval_info.degraded %}
+        <span class="retrieval-badge degraded">Degraded</span>
+      {% endif %}
+      {% if retrieval_info.lexical_hits %}
+        <span class="retrieval-stat">Lexical: <b>{{ retrieval_info.lexical_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.vector_hits %}
+        <span class="retrieval-stat">Vector: <b>{{ retrieval_info.vector_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.fused_hits %}
+        <span class="retrieval-stat">Fused: <b>{{ retrieval_info.fused_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.reranked_hits %}
+        <span class="retrieval-stat">Reranked: <b>{{ retrieval_info.reranked_hits }}</b></span>
+      {% endif %}
+      {% set lms = retrieval_info.latency_ms %}
+      {% if lms %}
+        <span class="retrieval-stat" style="margin-left:auto; color:#9ca3af; font-size:0.85em;">
+          {% if lms.lexical is defined %}lex {{ lms.lexical }}ms{% endif %}
+          {% if lms.vector is defined %} · vec {{ lms.vector }}ms{% endif %}
+          {% if lms.rrf is defined %} · rrf {{ lms.rrf }}ms{% endif %}
+          {% if lms.rerank is defined %} · rerank {{ lms.rerank }}ms{% endif %}
+        </span>
       {% endif %}
     </div>
   {% endif %}
@@ -213,6 +273,12 @@
             {% endfor %}
           </div>
           <div class="snippet">{{ r.snippet|safe }}</div>
+          {% if r.concepts %}
+            <div class="doc-concepts">
+              <small><b>Concepts:</b></small>
+              {{ render_concept_chips(r.concepts, 6) }}
+            </div>
+          {% endif %}
         </div>
       {% endfor %}
     </div>

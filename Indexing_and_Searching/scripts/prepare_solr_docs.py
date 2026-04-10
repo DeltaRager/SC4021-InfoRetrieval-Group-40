@@ -5,13 +5,19 @@ Layers:
   Loader     -> per-source CSV parsing
   Normalizer -> canonical SolrDoc creation
   Enrichment -> sentiment + model/vendor mention extraction + NLP (lemmatization/concepts)
-  Serializer -> JSONL output
+  Chunker    -> splits long search_text into overlapping chunks for vector indexing
+  Serializer -> JSONL output (one record per chunk, carrying full source-doc metadata)
 
 Sources:
   - bitcoin_ai_posts_comments_5000pool.csv          (3.1 schema)
   - information_security_ai_posts_comments_5000pool.csv (3.1 schema)
   - seo_ai_posts_comments_5000pool.csv              (3.1 schema)
   - reddit_ai_sentiment_shortened.csv               (sentiment schema)
+
+Output format:
+  Each output record is a chunk record with chunk_id as the Solr `id`.
+  The stable source-document id is stored in `doc_id`.
+  Short documents produce exactly one chunk (chunk_index=0).
 """
 
 import argparse
@@ -27,13 +33,32 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
-# Make project root importable so we can use nlp_utils
+# Make project root importable so we can use nlp_utils and hybrid_search
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
     from nlp_utils import process_for_indexing  # noqa: E402
     _NLP_AVAILABLE = True
 except ImportError:
     _NLP_AVAILABLE = False
+
+try:
+    from hybrid_search import EmbeddingClient, EMBED_BATCH_SIZE  # noqa: E402
+    _EMBEDDING_CLIENT = EmbeddingClient()
+    _EMBED_AVAILABLE = True
+except ImportError:
+    _EMBEDDING_CLIENT = None  # type: ignore[assignment]
+    _EMBED_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Chunking constants
+# ---------------------------------------------------------------------------
+
+CHUNK_TARGET_CHARS = 1200
+CHUNK_OVERLAP_CHARS = 200
+FALLBACK_CHUNK_TARGET_CHARS = 600
+FALLBACK_CHUNK_OVERLAP_CHARS = 100
+# Hard limit for a single embedding call; retry with smaller slice if exceeded
+EMBED_MAX_CHARS = 4000
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +281,263 @@ def enrich_nlp(text: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Chunking helpers
+# ---------------------------------------------------------------------------
+
+def _split_into_chunks(
+    text: str,
+    target: int = CHUNK_TARGET_CHARS,
+    overlap: int = CHUNK_OVERLAP_CHARS,
+) -> list[tuple[str, int, int]]:
+    """Split *text* into overlapping chunks.
+
+    Returns a list of (chunk_text, char_start, char_end) tuples.
+    The strategy is:
+      1. Try paragraph-aware splitting first.
+      2. Within each paragraph segment, apply sliding-window splitting if the
+         paragraph itself exceeds *target*.
+      3. Fall back to pure sliding windows when no paragraph structure exists.
+
+    Guarantees:
+      - At least one chunk is always returned.
+      - chunk_text strips leading/trailing whitespace.
+      - Overlapping prefix is taken from the end of the previous chunk.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    if len(text) <= target:
+        return [(text, 0, len(text))]
+
+    # Split on blank lines (paragraph boundaries)
+    paragraphs: list[str] = re.split(r"\n\s*\n", text)
+    # Collapse to non-empty paragraphs and record their char offsets
+    para_segments: list[tuple[str, int]] = []
+    pos = 0
+    for para in paragraphs:
+        stripped = para.strip()
+        if stripped:
+            # Find start of this paragraph in original text
+            start = text.find(stripped, pos)
+            if start == -1:
+                start = pos
+            para_segments.append((stripped, start))
+            pos = start + len(stripped)
+
+    if not para_segments:
+        para_segments = [(text, 0)]
+
+    chunks: list[tuple[str, int, int]] = []
+    prev_end = 0
+
+    for para_text, para_start in para_segments:
+        if len(para_text) <= target:
+            # Paragraph fits in one chunk
+            chunk_start = para_start
+            chunk_end = para_start + len(para_text)
+            if chunks:
+                # Prefix with overlap from previous chunk
+                prev_chunk_text = chunks[-1][0]
+                overlap_prefix = prev_chunk_text[max(0, len(prev_chunk_text) - overlap):]
+                combined = overlap_prefix + " " + para_text
+                chunks.append((combined.strip(), chunk_start, chunk_end))
+            else:
+                chunks.append((para_text, chunk_start, chunk_end))
+            prev_end = chunk_end
+        else:
+            # Paragraph too long: sliding window within it
+            start = 0
+            while start < len(para_text):
+                end = min(start + target, len(para_text))
+                slice_text = para_text[start:end].strip()
+                abs_start = para_start + start
+                abs_end = para_start + end
+                if chunks and start == 0:
+                    # Apply overlap prefix from previous chunk at paragraph boundary
+                    prev_chunk_text = chunks[-1][0]
+                    overlap_prefix = prev_chunk_text[max(0, len(prev_chunk_text) - overlap):]
+                    slice_text = (overlap_prefix + " " + slice_text).strip()
+                if slice_text:
+                    chunks.append((slice_text, abs_start, abs_end))
+                if end == len(para_text):
+                    break
+                start = end - overlap
+            prev_end = para_start + len(para_text)
+
+    if not chunks:
+        chunks = [(text, 0, len(text))]
+
+    return chunks
+
+
+def _make_chunk_records(
+    doc: dict,
+    target: int = CHUNK_TARGET_CHARS,
+    overlap: int = CHUNK_OVERLAP_CHARS,
+) -> list[dict]:
+    """Produce one or more chunk records from a source document dict.
+
+    Each chunk record is a full copy of the source-document metadata with
+    additional chunk fields.  The Solr `id` becomes the chunk id; the stable
+    source-document id is stored in `doc_id`.
+    """
+    source_id = doc["id"]
+    search_text = doc.get("search_text", "").strip()
+
+    if not search_text:
+        # No text to chunk: emit one record with no chunk_vector
+        chunk_rec = dict(doc)
+        chunk_rec["doc_id"] = source_id
+        chunk_rec["chunk_id"] = f"{source_id}__c0"
+        chunk_rec["id"] = chunk_rec["chunk_id"]
+        chunk_rec["chunk_index"] = 0
+        chunk_rec["chunk_text"] = ""
+        chunk_rec["chunk_count"] = 1
+        chunk_rec["chunk_char_start"] = 0
+        chunk_rec["chunk_char_end"] = 0
+        return [chunk_rec]
+
+    spans = _split_into_chunks(search_text, target=target, overlap=overlap)
+    records = []
+    for idx, (chunk_text, char_start, char_end) in enumerate(spans):
+        chunk_rec = dict(doc)
+        chunk_rec["doc_id"] = source_id
+        chunk_rec["chunk_id"] = f"{source_id}__c{idx}"
+        chunk_rec["id"] = chunk_rec["chunk_id"]
+        chunk_rec["chunk_index"] = idx
+        chunk_rec["chunk_text"] = chunk_text
+        chunk_rec["chunk_count"] = len(spans)
+        chunk_rec["chunk_char_start"] = char_start
+        chunk_rec["chunk_char_end"] = char_end
+        records.append(chunk_rec)
+
+    return records
+
+
+def _embed_chunk_records(docs: list[dict]) -> tuple[int, int, int]:
+    """Embed chunk_text for the provided chunk records.
+
+    Returns (attempted, success, skipped).
+    """
+    if not _EMBED_AVAILABLE or _EMBEDDING_CLIENT is None:
+        return 0, 0, 0
+
+    indices = [i for i, d in enumerate(docs) if d.get("chunk_text", "").strip()]
+    if not indices:
+        return 0, 0, 0
+
+    texts: list[str] = []
+    for i in indices:
+        ct = docs[i]["chunk_text"]
+        if len(ct) > EMBED_MAX_CHARS:
+            ct = ct[:EMBED_MAX_CHARS]
+        texts.append(ct)
+
+    embeddings = _EMBEDDING_CLIENT.embed_batch(texts, batch_size=EMBED_BATCH_SIZE)
+    success = 0
+    skipped = 0
+    for doc_idx, emb in zip(indices, embeddings):
+        if emb is not None:
+            docs[doc_idx]["chunk_vector"] = emb
+            success += 1
+        else:
+            docs[doc_idx].pop("chunk_vector", None)
+            skipped += 1
+    return len(indices), success, skipped
+
+
+def _source_doc_from_chunks(chunks: list[dict]) -> dict:
+    """Reconstruct a source-document dict from one or more chunk records."""
+    source = dict(chunks[0])
+    source["id"] = source.get("doc_id") or source["id"]
+    for key in (
+        "doc_id",
+        "chunk_id",
+        "chunk_index",
+        "chunk_text",
+        "chunk_count",
+        "chunk_char_start",
+        "chunk_char_end",
+        "chunk_vector",
+    ):
+        source.pop(key, None)
+    return source
+
+
+def embed_docs(docs: list[dict]) -> None:
+    """Embed chunk_text for each chunk record in-place, writing into 'chunk_vector'.
+
+    Chunk records that lack chunk_text are skipped.  On embedding failure the
+    field is not written — those chunks are still indexed for BM25 retrieval.
+
+    Retry logic:
+      - If a chunk text exceeds EMBED_MAX_CHARS, truncate it before retrying.
+      - If a batch call fails and contains multiple items, retry each item
+        individually (handled by EmbeddingClient.embed_batch).
+      - A single chunk that still fails after individual retry is skipped.
+
+    Emits a summary of:
+      - chunks attempted
+      - chunks embedded successfully
+      - chunks skipped
+    """
+    if not _EMBED_AVAILABLE or _EMBEDDING_CLIENT is None:
+        print("[INFO] Embedding service not available; skipping vector generation.")
+        return
+
+    embeddable = [d for d in docs if d.get("chunk_text", "").strip()]
+    if not embeddable:
+        return
+
+    print(f"[INFO] Embedding {len(embeddable)} chunks (batch_size={EMBED_BATCH_SIZE}) …")
+    attempted, _success, skipped = _embed_chunk_records(docs)
+
+    fallback_docs = 0
+    replaced_chunks = 0
+    if skipped:
+        failed_doc_ids = sorted({
+            d["doc_id"]
+            for d in docs
+            if d.get("chunk_text", "").strip() and "chunk_vector" not in d
+        })
+        for doc_id in failed_doc_ids:
+            original_chunks = [d for d in docs if d.get("doc_id") == doc_id]
+            if not original_chunks:
+                continue
+
+            original_missing = sum(
+                1 for d in original_chunks
+                if d.get("chunk_text", "").strip() and "chunk_vector" not in d
+            )
+            source_doc = _source_doc_from_chunks(original_chunks)
+            fallback_chunks = _make_chunk_records(
+                source_doc,
+                target=FALLBACK_CHUNK_TARGET_CHARS,
+                overlap=FALLBACK_CHUNK_OVERLAP_CHARS,
+            )
+            fallback_attempted, fallback_success, fallback_skipped = _embed_chunk_records(fallback_chunks)
+
+            if fallback_attempted and fallback_skipped < original_missing:
+                docs[:] = [d for d in docs if d.get("doc_id") != doc_id] + fallback_chunks
+                fallback_docs += 1
+                replaced_chunks += len(fallback_chunks)
+
+    final_attempted = sum(1 for d in docs if d.get("chunk_text", "").strip())
+    final_success = sum(1 for d in docs if d.get("chunk_text", "").strip() and "chunk_vector" in d)
+    final_skipped = final_attempted - final_success
+    print(
+        f"[INFO] Chunks embedded: {final_success}/{final_attempted}"
+        + (f"; skipped after retry: {final_skipped}" if final_skipped else "")
+        + (
+            f"; fallback rechunked docs: {fallback_docs} ({replaced_chunks} chunk record(s))"
+            if fallback_docs else ""
+        )
+        + "."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Source-specific loaders
 # ---------------------------------------------------------------------------
 
@@ -395,8 +677,12 @@ def prepare_docs(
     index_root: Path,
     sentiment_path: Optional[Path],
     output_path: Path,
-) -> tuple[int, int]:
-    all_docs: list[dict] = []
+) -> tuple[int, int, int]:
+    """Build chunk records and write them to *output_path*.
+
+    Returns (source_docs_processed, total_chunks, source_docs_with_zero_vectors).
+    """
+    source_docs: list[dict] = []
     seen: set[tuple] = set()
 
     # Load 3.1 CSVs
@@ -411,7 +697,7 @@ def prepare_docs(
             if sig in seen:
                 continue
             seen.add(sig)
-            all_docs.append(doc.to_dict())
+            source_docs.append(doc.to_dict())
 
     # Load sentiment CSV
     if sentiment_path and sentiment_path.exists():
@@ -421,16 +707,34 @@ def prepare_docs(
             if sig in seen:
                 continue
             seen.add(sig)
-            all_docs.append(doc.to_dict())
+            source_docs.append(doc.to_dict())
     elif sentiment_path:
         print(f"[WARN] Sentiment file not found: {sentiment_path}")
 
+    # Expand each source document into chunk records
+    all_chunks: list[dict] = []
+    for doc in source_docs:
+        all_chunks.extend(_make_chunk_records(doc))
+
+    print(f"[INFO] Source docs: {len(source_docs)}, chunk records: {len(all_chunks)}")
+
+    # Embed chunk_text for each chunk record
+    embed_docs(all_chunks)
+
+    # Count source docs with zero successfully embedded chunks
+    embedded_doc_ids: set[str] = {
+        c["doc_id"] for c in all_chunks if "chunk_vector" in c
+    }
+    zero_vector_docs = len(source_docs) - len(embedded_doc_ids)
+    if zero_vector_docs:
+        print(f"[WARN] {zero_vector_docs} source doc(s) have no embedded chunks.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
-        for doc in all_docs:
-            f.write(json.dumps(doc, ensure_ascii=False) + "\n")
+        for chunk in all_chunks:
+            f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
-    return len(all_docs), len(seen)
+    return len(source_docs), len(all_chunks), zero_vector_docs
 
 
 def main() -> None:
@@ -472,8 +776,13 @@ def main() -> None:
     if not _NLP_AVAILABLE:
         print("[WARN] nlp_utils not available; lemmatized_text and concepts will be empty.")
 
-    total, unique = prepare_docs(index_root, sentiment_path, output_path)
-    print(f"Indexed {total} docs ({unique} unique). Saved to {output_path}")
+    source_count, chunk_count, zero_vec = prepare_docs(index_root, sentiment_path, output_path)
+    print(
+        f"Indexed {source_count} source docs → {chunk_count} chunk records. "
+        f"Saved to {output_path}"
+        + (f" ({zero_vec} source doc(s) with zero vector chunks)" if zero_vec else "")
+        + "."
+    )
 
 
 if __name__ == "__main__":

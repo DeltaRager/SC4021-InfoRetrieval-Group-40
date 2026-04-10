@@ -19,7 +19,32 @@
     {"name": "vendor_mentions",       "type": "string",   "stored": true,  "indexed": true, "multiValued": true},
     {"name": "sentiment_label",       "type": "string",   "stored": true,  "indexed": true},
     {"name": "sentiment_score",       "type": "pfloat",   "stored": true,  "indexed": true},
-    {"name": "opinionatedness_score", "type": "pfloat",   "stored": true,  "indexed": true}
+    {"name": "opinionatedness_score", "type": "pfloat",   "stored": true,  "indexed": true},
+    {"name": "doc_id",                "type": "string",   "stored": true,  "indexed": true},
+    {"name": "chunk_id",              "type": "string",   "stored": true,  "indexed": true},
+    {"name": "chunk_index",           "type": "pint",     "stored": true,  "indexed": true},
+    {"name": "chunk_text",            "type": "text_en",  "stored": true,  "indexed": false},
+    {"name": "chunk_count",           "type": "pint",     "stored": true,  "indexed": false},
+    {"name": "chunk_char_start",      "type": "pint",     "stored": true,  "indexed": false},
+    {"name": "chunk_char_end",        "type": "pint",     "stored": true,  "indexed": false},
+    {
+      "name": "chunk_vector",
+      "type": "knn_vector",
+      "stored": true,
+      "indexed": true
+    }
+  ],
+
+  "add-field-type": [
+    {
+      "name":        "knn_vector",
+      "class":       "solr.DenseVectorField",
+      "vectorDimension": 1024,
+      "similarityFunction": "cosine",
+      "knnAlgorithm": "hnsw",
+      "hnswMaxConnections": 16,
+      "hnswBeamWidth":      100
+    }
   ],
 
   "add-copy-field": [

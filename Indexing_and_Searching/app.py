@@ -10,12 +10,19 @@ import requests
 from flask import Flask, render_template, request
 
 from nlp_utils import process_query
+from hybrid_search import (
+    EmbeddingClient,
+    RerankerClient,
+    HybridSearchService,
+    RetrievalInfo,
+    SEARCH_ROWS,
+)
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 
 SOLR_URL = os.getenv("SOLR_URL", "http://localhost:8983/solr/reddit_ai/select")
-DEFAULT_ROWS = 20
+DEFAULT_ROWS = SEARCH_ROWS
 REQUIRED_SOLR_FIELDS = {
     "title",
     "body",
@@ -28,6 +35,11 @@ REQUIRED_SOLR_FIELDS = {
     "vendor_mentions",
 }
 SAFE_TERM_RE = re.compile(r"^[\w*~.-]+$", re.ASCII)
+
+# Module-level service singletons (created once at import time).
+_embedder = EmbeddingClient()
+_reranker = RerankerClient()
+_hybrid   = HybridSearchService(SOLR_URL, _embedder, _reranker)
 
 
 def _build_fq(doc_type, subreddit, date_from, date_to,
@@ -204,6 +216,7 @@ def index() -> str:
     # Flask's request.args.get() returns only the first value ("0"),
     # so we must check if "1" appears anywhere in the value list.
     use_nlp = "1" in request.args.getlist("nlp") if request.args.getlist("nlp") else True
+    use_vector = "1" in request.args.getlist("vector") if request.args.getlist("vector") else True
 
     results: list[dict[str, Any]] = []
     response_ms = None
@@ -211,6 +224,7 @@ def index() -> str:
     facets: dict[str, Any] = {}
     error = ""
     nlp_info: dict[str, Any] = {}
+    retrieval_info: dict[str, Any] = {}
 
     if q:
         setup_error = _get_solr_setup_error(SOLR_URL)
@@ -229,11 +243,13 @@ def index() -> str:
                 model=model,
                 vendor=vendor,
                 use_nlp=use_nlp,
+                use_vector=use_vector,
                 results=results,
                 response_ms=response_ms,
                 num_found=num_found,
                 facets=facets,
                 nlp_info=nlp_info,
+                retrieval_info=retrieval_info,
                 error=error,
             )
 
@@ -272,41 +288,14 @@ def index() -> str:
             qf = "title^4 search_text^3 body^1.5 lemmatized_text^2.5 concepts^2"
             pf = "title^8 search_text^4 lemmatized_text^3"
 
-        params: dict[str, Any] = {
-            "q":       solr_q,
-            "defType": "edismax",
-            "qf":      qf,
-            "pf":      pf,
-            "mm":      "2<75%",
-            "fl":      ("id,type,title,body,subreddit,score,created_date,"
-                        "source_dataset,sentiment_label,sentiment_score,"
-                        "model_mentions,vendor_mentions,opinionatedness_score"),
-            "rows":    DEFAULT_ROWS,
-            "start":   0,
-            "wt":      "json",
-            "hl":      "true",
-            "hl.fl":   "search_text,body,title,lemmatized_text,concepts",
-            "hl.simple.pre":  "<mark>",
-            "hl.simple.post": "</mark>",
-            "facet":   "true",
-            "facet.field": [
-                "type", "subreddit", "sentiment_label",
-                "source_dataset", "model_mentions", "vendor_mentions",
-            ],
-            "sort":  sort,
-            # mild popularity boost via function query
-            "boost": "product(upvote_log,0.1)",
-        }
-
         # Build boost queries (bq) -- these only affect ranking, never
         # exclude documents.  We layer multiple signals:
         #   1. Lemmatized query  → rewards morphological matches
         #   2. Concept phrases   → rewards semantic matches
         #   3. Fuzzy original    → catches residual typos that spell-
         #                          correction missed (domain jargon etc.)
+        bq_parts: list[str] = []
         if use_nlp and nlp_info:
-            bq_parts: list[str] = []
-
             lemmatized_bq = _build_lemmatized_boost(nlp_info.get("lemmatized", ""), solr_q)
             if lemmatized_bq:
                 bq_parts.append(lemmatized_bq)
@@ -322,41 +311,36 @@ def index() -> str:
             if fuzzy_bq:
                 bq_parts.append(fuzzy_bq)
 
-            if bq_parts:
-                params["bq"] = bq_parts
-
-        if fq:
-            params["fq"] = fq
-
+        # ---- Hybrid retrieval pipeline ----
         start = time.perf_counter()
         try:
-            resp = requests.get(SOLR_URL, params=params, timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
+            results, facets, num_found, info = _hybrid.search(
+                solr_q=solr_q,
+                fq=fq,
+                qf=qf,
+                pf=pf,
+                bq=bq_parts,
+                sort=sort,
+                use_nlp=use_nlp,
+                query_text=q,  # use original query for semantic embedding
+                use_vector=use_vector,
+            )
             elapsed = (time.perf_counter() - start) * 1000
             response_ms = round(elapsed, 2)
+            retrieval_info = info.as_dict()
 
-            docs = payload.get("response", {}).get("docs", [])
-            num_found = payload.get("response", {}).get("numFound", 0)
-            highlighting = payload.get("highlighting", {})
+            # Surface any degradation warnings as the existing error banner
+            if info.degraded and info.warnings:
+                warn_text = " ".join(info.warnings)
+                if error:
+                    error = error + " " + warn_text
+                else:
+                    error = warn_text
 
-            for doc in docs:
-                hl = highlighting.get(doc["id"], {})
-                snippet = ""
-                for field_name in ("search_text", "body", "title", "lemmatized_text", "concepts"):
-                    if hl.get(field_name):
-                        snippet = hl[field_name][0]
-                        break
-                if not snippet:
-                    snippet = (doc.get("body") or doc.get("title") or "")[:260]
-
-                results.append({**doc, "snippet": snippet})
-
-            facets = payload.get("facet_counts", {}).get("facet_fields", {})
         except requests.HTTPError as exc:
             response = exc.response
             if response is not None:
-                _log_solr_error(response, params)
+                _log_solr_error(response, {"q": solr_q, "fq": fq})
                 error = (
                     "Solr rejected the query. Check the Flask search core schema and "
                     "server logs for the exact invalid parameter."
@@ -383,11 +367,13 @@ def index() -> str:
         model=model,
         vendor=vendor,
         use_nlp=use_nlp,
+        use_vector=use_vector,
         results=results,
         response_ms=response_ms,
         num_found=num_found,
         facets=facets,
         nlp_info=nlp_info,
+        retrieval_info=retrieval_info,
         error=error,
     )
 
