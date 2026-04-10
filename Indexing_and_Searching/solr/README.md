@@ -5,8 +5,10 @@ This folder contains a minimal reproducible pipeline for the SC4021 indexing tas
 ## 1) Start Solr
 
 ```bash
-docker run -d --name sc4021-solr -p 8983:8983 solr:9 solr-precreate reddit_ai
+docker compose up -d
 ```
+
+This repo standardizes the Flask search stack on the Solr core `reddit_ai`.
 
 ## 2) Create / update schema fields
 
@@ -45,11 +47,10 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open `http://localhost:5000`.
+Open `http://localhost:5001`.
 
 ## 6) Benchmark five required queries
 
 ```bash
 python scripts/benchmark_queries.py
 ```
-

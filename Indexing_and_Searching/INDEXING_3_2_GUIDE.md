@@ -27,7 +27,7 @@ docker compose up -d
 ```
 
 Solr UI: http://localhost:8983  
-Collection name: `reddit_ai`  *(created automatically from `docker-compose.yml`)*
+Core name: `reddit_ai`  *(created automatically from `docker-compose.yml`)*
 
 If the collection was not pre-created, run:
 
@@ -109,7 +109,12 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Open http://localhost:5000
+Open http://localhost:5001
+
+The Flask app defaults to `http://localhost:8983/solr/reddit_ai/select`. If you override
+`SOLR_URL`, point it at a core with the full `schema_add_fields.json` schema. On startup/query,
+the app now checks that the target core exists and contains the required fields used by the
+search UI.
 
 ### Filters available in the UI
 - **Type**: post / comment / unknown

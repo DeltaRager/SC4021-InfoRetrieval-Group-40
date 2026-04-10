@@ -1,37 +1,56 @@
 
 ## How to Run the Application
 
-The application is split into two parts: the Solr backend (Search Engine Database) and the Vite frontend (User Interface). You will need to start both.
+This repo currently contains two different UI paths:
 
-### 1. Start the Frontend UI (Required)
+- `Indexing_and_Searching/` is the canonical Solr-backed Flask search application. It expects the Solr core `reddit_ai`.
+- `ui/` is a separate Vite demo that currently runs in CSV mode and does not drive the Flask/Solr search stack directly.
 
-The UI is a lightweight web application built with Vanilla JS and served via Vite.
+If you want the full Solr-backed search engine, use the Flask path below.
 
-1. Open your terminal and navigate into the `ui` folder:
-   ```bash
-   cd ui
-   ```
-2. Start the Vite development server:
-   ```bash
-   npx vite
-   ```
-3. Open your browser and go to the local address provided (usually **http://localhost:5173**) to use the Search Engine interface!
+## Canonical Solr-Backed Search Stack
 
-### 2. Start the Apache Solr Backend
-The backend utilizes Apache Solr running inside a Docker container.
+The Flask application and Solr backend must both be running.
 
-**Start the Solr Engine:**
+### 1. Start Apache Solr
+
 ```bash
 docker compose up -d
 ```
-Solr will be available at [http://localhost:8983](http://localhost:8983). The `opinions_core` is created automatically on the first start.
 
-**Stop the Solr Engine:**
+Solr will be available at [http://localhost:8983](http://localhost:8983). The `reddit_ai` core is created automatically on the first start.
+
+### 2. Apply the Search Schema
+
+```bash
+cd Indexing_and_Searching
+curl -X POST -H "Content-type:application/json" \
+  http://localhost:8983/solr/reddit_ai/schema \
+  --data-binary "@schema_add_fields.json"
+```
+
+### 3. Run the Flask Search App
+
+```bash
+cd Indexing_and_Searching
+pip install -r requirements.txt
+python app.py
+```
+
+Open [http://localhost:5001](http://localhost:5001).
+
+The Flask app defaults to `http://localhost:8983/solr/reddit_ai/select`. Override this with `SOLR_URL` only if you intentionally use a different Solr core.
+
+### Solr Maintenance
+
+Stop the Solr service:
+
 ```bash
 docker compose down
 ```
 
-**Stop and permanently remove all indexed data:**
+Stop Solr and permanently remove indexed data:
+
 ```bash
 docker compose down -v
 ```
@@ -48,22 +67,32 @@ SC4021-InfoRetrieval-Group-40/
 │   ├── main.js                  ← Search logic, data loading, card rendering
 │   ├── style.css                ← All visual design and animations
 │   └── public/
-│       └── reddit_data.csv      ← ACTIVE DATASET (swap this to change dataset, must be named reddit_data.csv)
+│       └── reddit_data.csv      ← CSV dataset for the standalone Vite demo
 │
+├── Indexing_and_Searching/      ← Canonical Flask + Solr opinion-search stack
 ├── sample_reddit_data.csv       ← Blueprint showing the required CSV column format
-├── docker-compose.yml           ← Config to spin up Apache Solr locally
+├── docker-compose.yml           ← Config to spin up Apache Solr locally (`reddit_ai`)
 └── README.md                    
 ```
 
 ---
 
-## Search Modes (to be done)
+## Vite Demo Path
 
 | Mode | How it works | Requires |
 |---|---|---|
 | **CSV Mode** (current) | Loads all rows into browser, uses substring matching | Just Vite |
-| **Solr Mode** (future) | Sends query to Solr REST API, uses inverted index with BM25 ranking | Docker + Solr running |
+| **Flask + Solr Mode** | Uses the `Indexing_and_Searching/` app with Apache Solr and BM25-style ranking | Docker + Flask |
 
-Switching to Solr mode requires updating the `fetch` call in `main.js` from the CSV path to the Solr endpoint (`http://localhost:8983/solr/opinions_core/select`). 
+To run the standalone Vite demo:
+
+```bash
+cd ui
+npx vite
+```
+
+Open the local address printed by Vite, usually [http://localhost:5173](http://localhost:5173).
+
+The Vite demo should be treated as CSV-only unless it is explicitly reworked to call the Flask/Solr search backend.
 
 ---

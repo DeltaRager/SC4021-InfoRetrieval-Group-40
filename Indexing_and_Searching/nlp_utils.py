@@ -48,6 +48,28 @@ logger = logging.getLogger(__name__)
 _nlp: spacy.language.Language | None = None
 _yake_extractor: yake.KeywordExtractor | None = None
 _spell: SpellChecker | None = None
+PROTECTED_QUERY_TERMS = {
+    "chatgpt",
+    "openai",
+    "claude",
+    "anthropic",
+    "gemini",
+    "bard",
+    "llama",
+    "copilot",
+    "mistral",
+    "grok",
+    "deepseek",
+    "perplexity",
+    "palm",
+    "meta",
+    "microsoft",
+    "google",
+    "deepmind",
+    "xai",
+    "agi",
+    "llm",
+}
 
 
 def _get_nlp() -> spacy.language.Language:
@@ -98,7 +120,17 @@ def _load_domain_vocab(spell: SpellChecker) -> None:
         with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
                 doc = json.loads(line)
-                text = doc.get("full_text", "")
+                text = " ".join(
+                    part for part in (
+                        doc.get("search_text", ""),
+                        doc.get("full_text", ""),
+                        doc.get("title", ""),
+                        doc.get("body", ""),
+                        " ".join(doc.get("model_mentions", []) or []),
+                        " ".join(doc.get("vendor_mentions", []) or []),
+                    )
+                    if part
+                )
                 # Simple whitespace tokenisation; strip punctuation
                 for token in text.lower().split():
                     clean = token.strip(".,;:!?\"'()[]{}<>*#@_~`/\\|-")
@@ -114,6 +146,7 @@ def _load_domain_vocab(spell: SpellChecker) -> None:
     # loading nearly instant (~0.02 s for 5 000 words) instead of the
     # minutes it took with the old repeated-load approach.
     domain_words = [w for w, c in word_freq.items() if c >= 3]
+    domain_words.extend(sorted(PROTECTED_QUERY_TERMS))
     if domain_words:
         spell.word_frequency.load_words(domain_words)
         logger.debug("Loaded %d domain words into spell checker", len(domain_words))
@@ -364,6 +397,9 @@ def spell_correct_query(query: str) -> dict[str, Any]:
             continue
 
         lower = stripped.lower()
+        if lower in PROTECTED_QUERY_TERMS:
+            corrected_tokens.append(token)
+            continue
         if lower in spell:
             # Word is known -- no correction needed
             corrected_tokens.append(token)
