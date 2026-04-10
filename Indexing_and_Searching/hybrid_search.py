@@ -16,9 +16,10 @@ Config (env vars with defaults):
   HYBRID_LEXICAL_K     100
   HYBRID_VECTOR_K      200   (larger than lexical_k to compensate for multi-chunk docs)
   HYBRID_RRF_K         60
-  HYBRID_RERANK_K      50    (number of fused docs whose chunks are expanded for reranking)
-  HYBRID_RERANK_CHUNK_K 150  (max total chunks sent to reranker; caps expansion)
-  SEARCH_ROWS          20
+  HYBRID_RERANK_K      100   (number of fused docs whose chunks are expanded for reranking)
+  HYBRID_RERANK_CHUNK_K 300  (max total chunks sent to reranker; caps expansion)
+  HYBRID_RERANK_TOP_K  50    (top-N docs kept from reranker output for display)
+  SEARCH_ROWS          20    (used only in degraded/lexical-only path)
   EMBED_BATCH_SIZE     32
   EMBEDDING_DIM        1024
 """
@@ -47,8 +48,9 @@ RERANKER_URL     = os.getenv("RERANKER_URL",     "http://localhost:8082")
 HYBRID_LEXICAL_K      = int(os.getenv("HYBRID_LEXICAL_K",      "100"))
 HYBRID_VECTOR_K       = int(os.getenv("HYBRID_VECTOR_K",       "200"))
 HYBRID_RRF_K          = int(os.getenv("HYBRID_RRF_K",          "60"))
-HYBRID_RERANK_K       = int(os.getenv("HYBRID_RERANK_K",       "50"))
-HYBRID_RERANK_CHUNK_K = int(os.getenv("HYBRID_RERANK_CHUNK_K", "150"))
+HYBRID_RERANK_K       = int(os.getenv("HYBRID_RERANK_K",       "100"))
+HYBRID_RERANK_CHUNK_K = int(os.getenv("HYBRID_RERANK_CHUNK_K", "300"))
+HYBRID_RERANK_TOP_K   = int(os.getenv("HYBRID_RERANK_TOP_K",   "50"))
 SEARCH_ROWS           = int(os.getenv("SEARCH_ROWS",            "20"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE",  "32"))
 EMBEDDING_DIM    = int(os.getenv("EMBEDDING_DIM",     "1024"))
@@ -621,8 +623,10 @@ class HybridSearchService:
                 did = chunk_cand.doc_id
                 if did not in best_by_doc or chunk_cand.rerank_score > best_by_doc[did].rerank_score:
                     best_by_doc[did] = chunk_cand
-            # Sort docs by their best chunk's rerank score descending.
+            # Sort docs by their best chunk's rerank score descending, then
+            # slice to the top-K for display.
             reranked = sorted(best_by_doc.values(), key=lambda c: c.rerank_score, reverse=True)
+            reranked = reranked[:HYBRID_RERANK_TOP_K]
 
         info.reranked_hits = len(reranked)
 
