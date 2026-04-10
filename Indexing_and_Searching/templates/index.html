@@ -14,12 +14,22 @@
     mark { background: #ffe082; }
     .facet { background: #f8f8f8; padding: 8px; margin: 12px 0; border-radius: 6px; }
     .error { color: #b00020; }
+    .nlp-panel { background: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 8px; padding: 12px; margin: 12px 0; font-size: 0.92em; }
+    .nlp-panel b { color: #2e7d32; }
+    .nlp-label { display: inline-block; min-width: 140px; font-weight: 600; color: #555; }
+    .concept-tag { display: inline-block; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 4px; padding: 2px 8px; margin: 2px 3px; font-size: 0.88em; color: #1565c0; }
+    .nlp-toggle { font-size: 0.88em; color: #666; margin-left: 10px; }
+    .doc-concepts { margin-top: 6px; }
+    .auto-corrected { background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.95em; color: #1565c0; }
+    .auto-corrected .original { color: #999; text-decoration: line-through; }
+    .auto-corrected .corrected { color: #2e7d32; font-weight: 600; }
+    .auto-corrected .arrow { color: #888; margin: 0 4px; }
   </style>
 </head>
 <body>
   <h1>Reddit AI Search (Solr)</h1>
   <form method="get">
-    <input name="q" placeholder="Search full text (e.g., prompt injection)" value="{{ q }}" style="width:100%; margin-bottom: 8px;" />
+    <input name="q" placeholder="Search full text — supports prefix (artif) and wildcard (int*enc)" value="{{ q }}" style="width:100%; margin-bottom: 8px;" />
     <div class="filters">
       <select name="type">
         <option value="">All types</option>
@@ -35,10 +45,59 @@
       </select>
       <button type="submit">Search</button>
     </div>
+    <div class="nlp-toggle">
+      <label>
+        <input type="hidden" name="nlp" value="0" />
+        <input type="checkbox" name="nlp" value="1" {% if use_nlp %}checked{% endif %} />
+        Enable NLP enhancement (lemmatization + concept extraction)
+      </label>
+    </div>
   </form>
 
   {% if error %}
     <p class="error">{{ error }}</p>
+  {% endif %}
+
+  {# Auto-correction info bar: shown when query was auto-corrected, prefix-completed, or wildcard-expanded #}
+  {% if nlp_info and use_nlp and (nlp_info.has_typo or nlp_info.has_expansion) %}
+    <div class="auto-corrected">
+      Showing results for: <span class="corrected">{{ nlp_info.final_query }}</span>
+      &nbsp;&nbsp;
+      <small>
+        (
+        {% for wrong, right in nlp_info.get('expansions', {}).items() %}
+          <span class="original">{{ wrong }}</span> <span class="arrow">&rarr;</span> <span class="corrected">{{ right }}</span>
+          {{ ", " if not loop.last or nlp_info.corrections else "" }}
+        {% endfor %}
+        {% for wrong, right in nlp_info.get('corrections', {}).items() %}
+          <span class="original">{{ wrong }}</span> <span class="arrow">&rarr;</span> <span class="corrected">{{ right }}</span>
+          {{ ", " if not loop.last else "" }}
+        {% endfor %}
+        )
+      </small>
+    </div>
+  {% endif %}
+
+  {% if nlp_info and use_nlp %}
+    <div class="nlp-panel">
+      <b>NLP Query Analysis</b><br/>
+      <span class="nlp-label">Original query:</span> {{ nlp_info.original }}<br/>
+      {% if nlp_info.has_expansion %}
+        <span class="nlp-label">After expansion:</span> {{ nlp_info.expanded }}<br/>
+      {% endif %}
+      {% if nlp_info.has_typo %}
+        <span class="nlp-label">After spell correction:</span> {{ nlp_info.spell_corrected }}<br/>
+      {% endif %}
+      <span class="nlp-label">Final query:</span> <b>{{ nlp_info.final_query }}</b><br/>
+      <span class="nlp-label">Lemmatized:</span> {{ nlp_info.lemmatized }}<br/>
+      <span class="nlp-label">After stopword removal:</span> {{ nlp_info.cleaned }}<br/>
+      {% if nlp_info.concepts %}
+        <span class="nlp-label">Extracted concepts:</span>
+        {% for c in nlp_info.concepts[:8] %}
+          <span class="concept-tag">{{ c }}</span>
+        {% endfor %}
+      {% endif %}
+    </div>
   {% endif %}
 
   {% if response_ms is not none %}
@@ -57,6 +116,14 @@
     <div class="result">
       <div class="tags">{{ r.type }} · r/{{ r.subreddit }} · score={{ r.score }} · {{ r.created_date }}</div>
       <div>{{ r.snippet|safe }}</div>
+      {% if r.concepts %}
+        <div class="doc-concepts">
+          <small><b>Concepts:</b></small>
+          {% for c in r.concepts.split(' | ')[:6] %}
+            <span class="concept-tag">{{ c }}</span>
+          {% endfor %}
+        </div>
+      {% endif %}
     </div>
   {% endfor %}
 </body>

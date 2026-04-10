@@ -2,11 +2,16 @@ import argparse
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+
+# Make project root importable so we can use nlp_utils
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from nlp_utils import process_for_indexing  # noqa: E402
 
 INPUT_FILES = [
     "bitcoin_ai_posts_comments_5000pool.csv",
@@ -22,6 +27,8 @@ class SolrDoc:
     title: str
     body: str
     full_text: str
+    lemmatized_text: str
+    concepts: str
     subreddit: str
     score: int
     created_date: str
@@ -35,6 +42,8 @@ class SolrDoc:
             "title": self.title,
             "body": self.body,
             "full_text": self.full_text,
+            "lemmatized_text": self.lemmatized_text,
+            "concepts": self.concepts,
             "subreddit": self.subreddit,
             "score": self.score,
             "created_date": self.created_date,
@@ -80,6 +89,9 @@ def build_docs(df: pd.DataFrame, source_file: str) -> list[SolrDoc]:
         body = raw_text
         full_text = f"{title} {body}".strip()
 
+        # ---- NLP enrichment: lemmatization + concept extraction ----
+        nlp_fields = process_for_indexing(full_text)
+
         docs.append(
             SolrDoc(
                 id=hash_id([source_file, raw_text[:120], posted_time]),
@@ -87,6 +99,8 @@ def build_docs(df: pd.DataFrame, source_file: str) -> list[SolrDoc]:
                 title=title,
                 body=body,
                 full_text=full_text,
+                lemmatized_text=nlp_fields["lemmatized_text"],
+                concepts=nlp_fields["concepts"],
                 subreddit=subreddit,
                 score=score,
                 created_date=posted_time,

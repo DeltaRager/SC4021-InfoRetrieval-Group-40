@@ -2,3 +2,6 @@ flask>=3.0.0
 pandas>=2.0.0
 requests>=2.31.0
 python-dateutil>=2.9.0
+spacy>=3.7.0
+yake>=0.4.8
+pyspellchecker>=0.8.0

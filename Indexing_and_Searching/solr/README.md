@@ -17,11 +17,16 @@ curl -X POST -H "Content-type:application/json" http://localhost:8983/solr/reddi
 
 > If fields already exist, Solr may return an error; this is safe to ignore.
 
-## 3) Build JSONL docs from 3.1 crawling outputs
+## 3) Install NLP dependencies + Build JSONL docs
 
 ```bash
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
 python scripts/prepare_solr_docs.py --output data/reddit_docs.jsonl
 ```
+
+> The ETL script now runs spaCy lemmatization and YAKE concept extraction
+> on each document, producing `lemmatized_text` and `concepts` fields.
 
 ```bash
 python -c "import json; from pathlib import Path; p=Path(r'data\reddit_docs.jsonl'); docs=[json.loads(line) for line in p.open('r', encoding='utf-8') if line.strip()]; Path(r'data\reddit_docs.json').write_text(json.dumps(docs, ensure_ascii=False), encoding='utf-8')"
