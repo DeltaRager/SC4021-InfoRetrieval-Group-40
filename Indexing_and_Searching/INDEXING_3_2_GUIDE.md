@@ -101,7 +101,42 @@ curl "http://localhost:8983/solr/reddit_ai/select?q=*:*&rows=0&wt=json" | python
 
 ---
 
-## Step 6 — Run the Flask UI
+## Step 6 — Start the embedding and reranker models
+
+The hybrid retrieval pipeline requires two local model servers powered by **llama.cpp**.
+
+### Install llama.cpp
+
+Follow the official instructions at https://github.com/ggerganov/llama.cpp to build or install `llama-server` for your platform.
+
+### Download the models
+
+| Model | Source |
+|---|---|
+| `jina-embeddings-v3-f16.gguf` | https://huggingface.co/gaianet/jina-embeddings-v3-GGUF |
+| `bge-reranker-v2-m3-FP16.gguf` | https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF |
+
+Place both `.gguf` files under `~/Desktop/Models/` (or adjust the paths in the commands below).
+
+### Start the embedding server (port 8081)
+
+```bash
+llama-server -m ~/Desktop/Models/jina-embeddings-v3-f16.gguf --embeddings --port 8081 -c 8192
+```
+
+### Start the reranker server (port 8082)
+
+```bash
+llama-server -m ~/Desktop/Models/bge-reranker-v2-m3-FP16.gguf --rerank --port 8082 -c 8192
+```
+
+Keep both servers running in separate terminals before starting the Flask app. The app calls:
+- `http://localhost:8081/v1/embeddings` for dense vector search
+- `http://localhost:8082/v1/rerank` for cross-encoder reranking
+
+---
+
+## Step 7 — Run the Flask UI
 
 ```bash
 cd Indexing_and_Searching
@@ -130,7 +165,7 @@ Sentiment, Dataset, AI Model, Subreddit, Type — all clickable to drill down.
 
 ---
 
-## Step 7 — Run benchmarks
+## Step 8 — Run benchmarks
 
 ```bash
 cd Indexing_and_Searching
