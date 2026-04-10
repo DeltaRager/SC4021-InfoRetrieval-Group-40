@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 from typing import Any
@@ -15,14 +16,48 @@ SOLR_URL = os.getenv("SOLR_URL", "http://localhost:8983/solr/reddit_ai/select")
 DEFAULT_ROWS = 20
 
 
+def _build_fq(doc_type, subreddit, date_from, date_to,
+              sentiment, source_dataset, model, vendor):
+    fq = []
+    if doc_type:
+        fq.append(f"type:{doc_type}")
+    if subreddit:
+        fq.append(f"subreddit:{subreddit}")
+    if date_from or date_to:
+        d_from = (date_from + "T00:00:00Z") if date_from else "*"
+        d_to   = (date_to   + "T23:59:59Z") if date_to   else "*"
+        fq.append(f"created_date:[{d_from} TO {d_to}]")
+    if sentiment:
+        fq.append(f"sentiment_label:{sentiment}")
+    if source_dataset:
+        fq.append(f"source_dataset:{source_dataset}")
+    if model:
+        fq.append(f"model_mentions:{model}")
+    if vendor:
+        fq.append(f"vendor_mentions:{vendor}")
+    return fq
+
+
+def _popularity_boost(score_str: str) -> float:
+    """log(score+1) capped at 10 for bq boost."""
+    try:
+        return round(min(math.log1p(max(int(score_str), 0)), 10), 2)
+    except Exception:
+        return 0.0
+
+
 @app.get("/")
 def index() -> str:
-    q = request.args.get("q", "").strip()
-    doc_type = request.args.get("type", "")
-    subreddit = request.args.get("subreddit", "")
-    date_from = request.args.get("date_from", "")
-    date_to = request.args.get("date_to", "")
-    sort = request.args.get("sort", "score desc")
+    q              = request.args.get("q", "").strip()
+    doc_type       = request.args.get("type", "")
+    subreddit      = request.args.get("subreddit", "")
+    date_from      = request.args.get("date_from", "")
+    date_to        = request.args.get("date_to", "")
+    sort           = request.args.get("sort", "score desc")
+    sentiment      = request.args.get("sentiment", "")
+    source_dataset = request.args.get("source_dataset", "")
+    model          = request.args.get("model", "")
+    vendor         = request.args.get("vendor", "")
     # Toggle: enable/disable NLP enhancement (on by default).
     # The HTML form sends both a hidden input (value="0") and a checkbox
     # (value="1"), so when checked the URL contains nlp=0&nlp=1.
@@ -60,39 +95,43 @@ def index() -> str:
                 nlp_info = {}
                 error = f"NLP enhancement failed ({type(exc).__name__}: {exc}). Falling back to basic search."
 
-        fq = []
-        if doc_type:
-            fq.append(f"type:{doc_type}")
-        if subreddit:
-            fq.append(f"subreddit:{subreddit}")
-        if date_from or date_to:
-            date_from_safe = date_from + "T00:00:00Z" if date_from else "*"
-            date_to_safe = date_to + "T23:59:59Z" if date_to else "*"
-            fq.append(f"created_date:[{date_from_safe} TO {date_to_safe}]")
+        fq = _build_fq(doc_type, subreddit, date_from, date_to,
+                       sentiment, source_dataset, model, vendor)
 
         # Build query-field weights:
-        #   - Original fields for exact-match relevance
+        #   - search_text for combined retrieval
         #   - lemmatized_text for morphological recall (lemma matching)
         #   - concepts for semantic/keyphrase matching
-        qf = "title^2 body full_text^3"
+        qf = "title^4 search_text^3 body^1.5"
+        pf = "title^8 search_text^4"
         if use_nlp:
-            qf = "title^2 body full_text^3 lemmatized_text^2.5 concepts^2"
+            qf = "title^4 search_text^3 body^1.5 lemmatized_text^2.5 concepts^2"
+            pf = "title^8 search_text^4 lemmatized_text^3"
 
         params: dict[str, Any] = {
-            "q": solr_q,
+            "q":       solr_q,
             "defType": "edismax",
-            "qf": qf,
-            "fl": "id,type,title,body,subreddit,score,created_date,thread_id,concepts",
-            "rows": DEFAULT_ROWS,
-            "start": 0,
-            "wt": "json",
-            "hl": "true",
-            "hl.fl": "title,body,full_text,lemmatized_text,concepts",
-            "hl.simple.pre": "<mark>",
+            "qf":      qf,
+            "pf":      pf,
+            "mm":      "2<75%",
+            "fl":      ("id,type,title,body,subreddit,score,created_date,"
+                        "source_dataset,sentiment_label,sentiment_score,"
+                        "model_mentions,vendor_mentions,opinionatedness_score"),
+            "rows":    DEFAULT_ROWS,
+            "start":   0,
+            "wt":      "json",
+            "hl":      "true",
+            "hl.fl":   "search_text,body,title,lemmatized_text,concepts",
+            "hl.simple.pre":  "<mark>",
             "hl.simple.post": "</mark>",
-            "facet": "true",
-            "facet.field": ["type", "subreddit"],
-            "sort": sort,
+            "facet":   "true",
+            "facet.field": [
+                "type", "subreddit", "sentiment_label",
+                "source_dataset", "model_mentions", "vendor_mentions",
+            ],
+            "sort":  sort,
+            # mild popularity boost via function query
+            "boost": "product(upvote_log,0.1)",
         }
 
         # Build boost queries (bq) -- these only affect ranking, never
@@ -120,7 +159,7 @@ def index() -> str:
             # match even if pyspellchecker didn't know the correct word.
             fuzzy_q = nlp_info.get("fuzzy", "")
             if fuzzy_q and fuzzy_q != solr_q:
-                bq_parts.append(f"full_text:({fuzzy_q})^1.2")
+                bq_parts.append(f"search_text:({fuzzy_q})^1.2")
 
             if bq_parts:
                 params["bq"] = bq_parts
@@ -143,19 +182,14 @@ def index() -> str:
             for doc in docs:
                 hl = highlighting.get(doc["id"], {})
                 snippet = ""
-                for field in ("full_text", "body", "title"):
-                    if hl.get(field):
-                        snippet = hl[field][0]
+                for field_name in ("search_text", "body", "title", "lemmatized_text", "concepts"):
+                    if hl.get(field_name):
+                        snippet = hl[field_name][0]
                         break
                 if not snippet:
                     snippet = (doc.get("body") or doc.get("title") or "")[:260]
 
-                results.append(
-                    {
-                        **doc,
-                        "snippet": snippet,
-                    }
-                )
+                results.append({**doc, "snippet": snippet})
 
             facets = payload.get("facet_counts", {}).get("facet_fields", {})
         except requests.RequestException as exc:
@@ -169,6 +203,10 @@ def index() -> str:
         date_from=date_from,
         date_to=date_to,
         sort=sort,
+        sentiment=sentiment,
+        source_dataset=source_dataset,
+        model=model,
+        vendor=vendor,
         use_nlp=use_nlp,
         results=results,
         response_ms=response_ms,

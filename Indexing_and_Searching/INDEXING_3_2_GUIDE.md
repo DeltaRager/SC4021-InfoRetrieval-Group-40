@@ -1,41 +1,192 @@
-# SC4021 - 3.2 Indexing Delivery Guide
+# SC4021 — 3.2 Indexing Guide (AI Opinion Search Engine)
 
-This repository now includes a **minimum viable 3.2 implementation** based on your 3.1 Reddit crawling CSV files.
+## Overview
 
-## Included components
+This guide covers the full pipeline for indexing ~4.8k Reddit documents across four sources into a fielded BM25
+Solr index optimised for opinion retrieval.
 
-1. **Indexing pipeline** (`scripts/prepare_solr_docs.py` + `nlp_utils.py`)
-   - Reads 3 CSV files from 3.1
-   - Cleans text, removes duplicates, creates Solr-ready JSONL docs
-   - Builds fields required for retrieval: `id`, `type`, `title`, `body`, `full_text`, `subreddit`, `score`, `created_date`, `thread_id`
-   - **NLP enrichment**: generates `lemmatized_text` (spaCy lemmatization) and `concepts` (YAKE + spaCy noun chunks + NER) for each document
+**Sources indexed:**
+| File | Dataset label | Schema |
+|---|---|---|
+| `bitcoin_ai_posts_comments_5000pool.csv` | `bitcoin` | 3.1 CSV |
+| `information_security_ai_posts_comments_5000pool.csv` | `information_security` | 3.1 CSV |
+| `seo_ai_posts_comments_5000pool.csv` | `seo` | 3.1 CSV |
+| `reddit_ai_sentiment_shortened.csv` | `reddit_ai_sentiment` | Sentiment CSV |
 
-2. **Simple query UI** (`app.py` + `templates/index.html`)
-   - Search box
-   - Filters: `type`, `subreddit`, `date range`
-   - Sort: score / newest
-   - Highlights matched terms
-   - Shows response time in milliseconds
+**Pipeline** (`scripts/prepare_solr_docs.py` + `nlp_utils.py`):
+- Cleans text, removes duplicates, creates Solr-ready JSONL docs
+- Enriches each document with sentiment label/score, model/vendor mentions, opinionatedness score
+- **NLP enrichment** (when `nlp_utils` is available): generates `lemmatized_text` (spaCy lemmatization) and `concepts` (YAKE + spaCy noun chunks + NER)
 
-3. **Five-query speed test** (`scripts/benchmark_queries.py`)
-   - Runs 5 representative queries required by the assignment
-   - Prints result count and latency
+---
 
-4. **Solr setup instructions** (`solr/README.md`)
-   - Docker startup
-   - Schema creation
-   - Data indexing
+## Step 1 — Start Solr
 
-## Suggested writeup mapping to assignment
+```bash
+docker compose up -d
+```
 
-- **Q2 (Indexing + UI + five queries + speed):**
-  - Use `solr/README.md` commands and UI screenshots.
-- **Q3 (Innovation):**
-  - Timeline filtering (`date_from`, `date_to`)
-  - Faceted search (`type`, `subreddit` facets)
-  - Highlight snippets (`hl=true` in Solr query)
-  - **Lemmatization** (`nlp_utils.py`): spaCy-based POS-aware lemmatization applied at both index time and query time. Reduces morphological variants to dictionary forms (e.g., "running" -> "run", "bought" -> "buy") so that queries like "artificially intelligent" can match documents about "artificial intelligence".
-  - **Concept Extraction** (`nlp_utils.py`): Combines YAKE keyphrase extraction with spaCy noun chunks and named entity recognition to extract multi-word concepts. Enables semantic-level matching beyond individual keywords.
-  - **Smart Stopword Removal**: Removes common stopwords while preserving them inside meaningful phrases detected via noun chunks and named entities (e.g., "King of Denmark", "flights to London").
-  - **Boost queries**: Lemmatized and concept fields are used as Solr boost queries (`bq`) to improve ranking without excluding results.
+Solr UI: http://localhost:8983  
+Collection name: `reddit_ai`  *(created automatically from `docker-compose.yml`)*
 
+If the collection was not pre-created, run:
+
+```bash
+docker exec -it sc4021-solr solr create_core -c reddit_ai
+```
+
+---
+
+## Step 2 — Apply schema
+
+```bash
+curl -X POST -H 'Content-Type: application/json' \
+  http://localhost:8983/solr/reddit_ai/schema \
+  --data-binary @schema_add_fields.json
+```
+
+This adds all canonical opinion-search fields:
+`type`, `title`, `body`, `search_text`, `lemmatized_text`, `concepts`, `subreddit`, `score`, `upvote_log`,
+`created_date`, `time_bucket`, `source_dataset`, `source_schema`, `source_id`, `url`,
+`model_mentions`, `vendor_mentions`, `sentiment_label`, `sentiment_score`, `opinionatedness_score`.
+
+---
+
+## Step 3 — Run the ingestion pipeline
+
+```bash
+cd Indexing_and_Searching
+python scripts/prepare_solr_docs.py
+```
+
+The script auto-detects `reddit_ai_sentiment_shortened.csv` in common locations.
+If it cannot find it, pass the path explicitly:
+
+```bash
+python scripts/prepare_solr_docs.py \
+  --sentiment-file "/path/to/reddit_ai_sentiment_shortened.csv"
+```
+
+Output: `data/reddit_docs.jsonl` (one JSON document per line).
+
+---
+
+## Step 4 — Convert JSONL to JSON array
+
+```bash
+python - <<'EOF'
+import json, pathlib
+docs = [json.loads(l) for l in open("data/reddit_docs.jsonl")]
+open("data/reddit_docs.json", "w").write(json.dumps(docs, ensure_ascii=False))
+print(f"Converted {len(docs)} docs.")
+EOF
+```
+
+---
+
+## Step 5 — Index into Solr
+
+```bash
+curl -X POST \
+  "http://localhost:8983/solr/reddit_ai/update?commit=true" \
+  -H "Content-Type: application/json" \
+  --data-binary @data/reddit_docs.json
+```
+
+Verify:
+
+```bash
+curl "http://localhost:8983/solr/reddit_ai/select?q=*:*&rows=0&wt=json" | python -m json.tool | grep numFound
+```
+
+---
+
+## Step 6 — Run the Flask UI
+
+```bash
+cd Indexing_and_Searching
+pip install -r requirements.txt
+python app.py
+```
+
+Open http://localhost:5000
+
+### Filters available in the UI
+- **Type**: post / comment / unknown
+- **Sentiment**: positive / negative / neutral / mixed
+- **Dataset**: bitcoin / information_security / seo / reddit_ai_sentiment
+- **AI Model**: chatgpt / claude / gemini / llama / copilot / mistral / grok / deepseek / perplexity
+- **Subreddit**: free text
+- **Date range**: from / to
+- **Sort**: Top score / Newest
+
+### Facets displayed in the sidebar
+Sentiment, Dataset, AI Model, Subreddit, Type — all clickable to drill down.
+
+---
+
+## Step 7 — Run benchmarks
+
+```bash
+cd Indexing_and_Searching
+python scripts/benchmark_queries.py
+```
+
+Prints result count and latency for:
+- 5 baseline queries (original 3.2 requirements)
+- 5 opinion-specific queries
+- 3 facet/filter spot checks
+
+---
+
+## Solr query profile
+
+| Parameter | Value |
+|---|---|
+| `defType` | `edismax` |
+| `qf` | `title^4 search_text^3 body^1.5` (+ `lemmatized_text^2.5 concepts^2` when NLP on) |
+| `pf` | `title^8 search_text^4` (+ `lemmatized_text^3` when NLP on) |
+| `mm` | `2<75%` |
+| `boost` | `product(upvote_log, 0.1)` |
+| `bq` (NLP on) | lemmatized query^2, concept phrases^1.5, fuzzy fallback^1.2 |
+| Highlighting | `search_text`, `body`, `title`, `lemmatized_text`, `concepts` |
+
+---
+
+## Field reference
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | string | SHA1 or stable Reddit ID |
+| `source_id` | string | Original Reddit ID (sentiment file only) |
+| `source_dataset` | string | bitcoin / information_security / seo / reddit_ai_sentiment |
+| `source_schema` | string | 3.1_csv / sentiment_csv |
+| `type` | string | post / comment / unknown |
+| `title` | text_en | First 150 chars for posts |
+| `body` | text_en | Full text |
+| `search_text` | text_en | Combined retrieval field |
+| `lemmatized_text` | text_en | spaCy-lemmatized form for morphological recall |
+| `concepts` | text_en | YAKE + noun chunks + NER keyphrases |
+| `subreddit` | string (exact) | Facet-ready |
+| `score` | pint | Raw upvote count |
+| `upvote_log` | pfloat | log(score+1) for boost |
+| `created_date` | pdate | ISO-8601 UTC |
+| `time_bucket` | string | recent_week / recent_month / recent_quarter / older |
+| `url` | string | Reddit URL when available |
+| `model_mentions` | string[] | chatgpt / claude / gemini / llama / … |
+| `vendor_mentions` | string[] | openai / anthropic / google / meta / … |
+| `sentiment_label` | string | positive / negative / neutral / mixed |
+| `sentiment_score` | pfloat | [-1.0, 1.0] |
+| `opinionatedness_score` | pfloat | [0.0, 1.0] |
+
+---
+
+## Assignment writeup mapping
+
+| Assignment section | Evidence |
+|---|---|
+| Indexing + schema | Step 2 (`schema_add_fields.json`) + `managed-schema.xml` |
+| Five benchmark queries | Step 7 output table |
+| UI + filters | Step 6 screenshot (type, sentiment, model, dataset, subreddit, date) |
+| Speed | Benchmark latency column |
+| Innovation | Sentiment/opinion fields, model/vendor facets, eDisMax + phrase boost, `time_bucket` |
