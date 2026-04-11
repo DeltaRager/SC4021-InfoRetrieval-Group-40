@@ -15,6 +15,26 @@ SOLR_URL = os.getenv("SOLR_URL", "http://localhost:8983/solr/reddit_ai/select")
 DEFAULT_ROWS = 20
 
 
+def get_indexed_classification(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    classification: dict[str, dict[str, Any]] = {}
+
+    if doc.get("subjectivity_label"):
+        confidence = doc.get("subjectivity_confidence")
+        classification["subjectivity"] = {
+            "label": doc["subjectivity_label"],
+            "score": float(confidence) if confidence is not None else None,
+        }
+
+    if doc.get("polarity_label"):
+        confidence = doc.get("polarity_confidence")
+        classification["polarity"] = {
+            "label": doc["polarity_label"],
+            "score": float(confidence) if confidence is not None else None,
+        }
+
+    return classification
+
+
 @app.get("/")
 def index() -> str:
     q = request.args.get("q", "").strip()
@@ -82,7 +102,10 @@ def index() -> str:
             "q": solr_q,
             "defType": "edismax",
             "qf": qf,
-            "fl": "id,type,title,body,subreddit,score,created_date,thread_id,concepts",
+            "fl": (
+                "id,type,title,body,subreddit,score,created_date,thread_id,concepts,"
+                "subjectivity_label,subjectivity_confidence,polarity_label,polarity_confidence"
+            ),
             "rows": DEFAULT_ROWS,
             "start": 0,
             "wt": "json",
@@ -154,6 +177,7 @@ def index() -> str:
                     {
                         **doc,
                         "snippet": snippet,
+                        "classification": get_indexed_classification(doc),
                     }
                 )
 

@@ -24,6 +24,9 @@
     .auto-corrected .original { color: #999; text-decoration: line-through; }
     .auto-corrected .corrected { color: #2e7d32; font-weight: 600; }
     .auto-corrected .arrow { color: #888; margin: 0 4px; }
+    .classification { margin-top: 8px; font-size: 0.9em; color: #333; }
+    .classification-row { margin-top: 4px; }
+    .classification-label { font-weight: 600; text-transform: capitalize; }
   </style>
 </head>
 <body>
@@ -116,6 +119,28 @@
     <div class="result">
       <div class="tags">{{ r.type }} · r/{{ r.subreddit }} · score={{ r.score }} · {{ r.created_date }}</div>
       <div>{{ r.snippet|safe }}</div>
+      {% if r.classification %}
+        <div class="classification">
+          {% if r.classification.subjectivity %}
+            <div class="classification-row">
+              <span class="classification-label">Subjectivity:</span>
+              {{ r.classification.subjectivity.label }}
+              {% if r.classification.subjectivity.score is not none %}
+                ({{ "%.0f"|format(r.classification.subjectivity.score * 100) }}%)
+              {% endif %}
+            </div>
+          {% endif %}
+          {% if r.classification.polarity %}
+            <div class="classification-row">
+              <span class="classification-label">Polarity:</span>
+              {{ r.classification.polarity.label }}
+              {% if r.classification.polarity.score is not none %}
+                ({{ "%.0f"|format(r.classification.polarity.score * 100) }}%)
+              {% endif %}
+            </div>
+          {% endif %}
+        </div>
+      {% endif %}
       {% if r.concepts %}
         <div class="doc-concepts">
           <small><b>Concepts:</b></small>

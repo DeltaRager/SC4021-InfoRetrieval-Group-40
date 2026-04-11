@@ -7,3 +7,13 @@ docker-volumes/
 
 # Text files
 pdf_text.txt
+data/
+eda_analysis.ipynb
+data/archive
+data/review_polarity
+polarity.ipynb
+data_extraction/
+SC4021 Models/
+roberta-finetuned/
+reddit_scraper_v2.py
+Indexing_and_Searching/__pycache__/
