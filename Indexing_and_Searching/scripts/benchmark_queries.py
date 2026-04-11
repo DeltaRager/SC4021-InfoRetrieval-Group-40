@@ -114,9 +114,9 @@ def run_bench_solr(solr_url: str) -> None:
     print("FACET / FILTER SPOT CHECKS")
     print("-" * 70)
     spot_checks = [
-        ("ChatGPT privacy", {"fq": "sentiment_label:negative"}),
+        ("ChatGPT privacy", {"fq": "polarity_label:negative"}),
         ("Claude",          {"fq": "model_mentions:claude"}),
-        ("AI regulation",   {"fq": "source_dataset:reddit_ai_sentiment"}),
+        ("AI regulation",   {"fq": "source_dataset:mega_ai_posts_comments_classified"}),
     ]
     for q, extra in spot_checks:
         label = f"{q} [{extra.get('fq', '')}]"

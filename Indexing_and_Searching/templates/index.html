@@ -13,23 +13,20 @@
     .filters   { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
     input, select, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
     .meta      { color: #555; margin: 8px 0 14px; font-size: 0.9em; }
-    .layout    { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
-    .facet-panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; align-self: start; font-size: 0.88em; }
-    .facet-panel h3 { margin: 0 0 8px; font-size: 1em; }
-    .facet-group { margin-bottom: 12px; }
-    .facet-group h4 { margin: 0 0 4px; color: #444; font-size: 0.9em; text-transform: uppercase; letter-spacing: .03em; }
-    .facet-link { display: block; color: #0079d3; text-decoration: none; padding: 2px 0; }
-    .facet-link:hover { text-decoration: underline; }
+    .layout    { display: block; }
     .result    { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
     .tags      { font-size: 0.82em; color: #555; margin-bottom: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
     .badge     { padding: 2px 7px; border-radius: 12px; font-size: 0.8em; font-weight: 600; }
     .badge-post    { background: #e8f5e9; color: #2e7d32; }
     .badge-comment { background: #e3f2fd; color: #1565c0; }
     .badge-unknown { background: #fafafa; color: #777; border: 1px solid #ddd; }
-    .badge-positive { background: #e8f5e9; color: #2e7d32; }
-    .badge-negative { background: #ffebee; color: #b71c1c; }
-    .badge-neutral  { background: #f5f5f5; color: #555; }
-    .badge-mixed    { background: #fff3e0; color: #e65100; }
+    .badge-positive    { background: #e8f5e9; color: #2e7d32; }
+    .badge-negative    { background: #ffebee; color: #b71c1c; }
+    .badge-neutral     { background: #f5f5f5; color: #555; }
+    .badge-mixed       { background: #fff3e0; color: #e65100; }
+    .badge-subjective  { background: #fff8e1; color: #f57f17; }
+    .badge-objective   { background: #e8eaf6; color: #283593; }
+    .badge-unknown     { background: #fafafa; color: #777; border: 1px solid #ddd; }
     mark       { background: #ffe082; }
     .error     { color: #b00020; }
     .model-tag { background: #ede7f6; color: #4527a0; padding: 2px 7px; border-radius: 12px; font-size: 0.78em; }
@@ -86,19 +83,20 @@
         <option value="comment" {% if doc_type == 'comment' %}selected{% endif %}>Comment</option>
         <option value="unknown" {% if doc_type == 'unknown' %}selected{% endif %}>Unknown</option>
       </select>
-      <select name="sentiment">
-        <option value="">Any sentiment</option>
-        <option value="positive" {% if sentiment == 'positive' %}selected{% endif %}>Positive</option>
-        <option value="negative" {% if sentiment == 'negative' %}selected{% endif %}>Negative</option>
-        <option value="neutral"  {% if sentiment == 'neutral'  %}selected{% endif %}>Neutral</option>
-        <option value="mixed"    {% if sentiment == 'mixed'    %}selected{% endif %}>Mixed</option>
+      <select name="polarity">
+        <option value="">Any polarity</option>
+        <option value="positive" {% if polarity == 'positive' %}selected{% endif %}>Positive</option>
+        <option value="negative" {% if polarity == 'negative' %}selected{% endif %}>Negative</option>
+        <option value="neutral"  {% if polarity == 'neutral'  %}selected{% endif %}>Neutral</option>
+      </select>
+      <select name="subjectivity">
+        <option value="">Any subjectivity</option>
+        <option value="subjective" {% if subjectivity == 'subjective' %}selected{% endif %}>Subjective</option>
+        <option value="objective"  {% if subjectivity == 'objective'  %}selected{% endif %}>Objective</option>
       </select>
       <select name="source_dataset">
         <option value="">All datasets</option>
-        <option value="bitcoin"              {% if source_dataset == 'bitcoin'              %}selected{% endif %}>Bitcoin</option>
-        <option value="information_security" {% if source_dataset == 'information_security' %}selected{% endif %}>InfoSec</option>
-        <option value="seo"                  {% if source_dataset == 'seo'                  %}selected{% endif %}>SEO</option>
-        <option value="reddit_ai_sentiment"  {% if source_dataset == 'reddit_ai_sentiment'  %}selected{% endif %}>Reddit AI Sentiment</option>
+        <option value="mega_ai_posts_comments_classified" {% if source_dataset == 'mega_ai_posts_comments_classified' %}selected{% endif %}>Classified</option>
       </select>
       <select name="model">
         <option value="">Any model</option>
@@ -235,36 +233,6 @@
   {% if results or facets %}
   <div class="layout">
 
-    <!-- Facet sidebar -->
-    <div class="facet-panel">
-      <h3>Refine results</h3>
-
-      {% macro facet_links(field_name, facet_key, label) %}
-        {% set pairs = facets.get(facet_key, []) %}
-        {% if pairs %}
-        <div class="facet-group">
-          <h4>{{ label }}</h4>
-          {% for i in range(0, pairs|length - 1, 2) %}
-            {% set val   = pairs[i] %}
-            {% set count = pairs[i+1] %}
-            {% if count > 0 %}
-              <a class="facet-link" href="?q={{ q }}&{{ field_name }}={{ val }}&type={{ doc_type }}&subreddit={{ subreddit }}&sentiment={{ sentiment }}&source_dataset={{ source_dataset }}&model={{ model }}&vendor={{ vendor }}&sort={{ sort }}">
-                {{ val }} ({{ count }})
-              </a>
-            {% endif %}
-          {% endfor %}
-        </div>
-        {% endif %}
-      {% endmacro %}
-
-      {{ facet_links('sentiment',      'sentiment_label',  'Sentiment')   }}
-      {{ facet_links('source_dataset', 'source_dataset',   'Dataset')     }}
-      {{ facet_links('model',          'model_mentions',   'AI Model')    }}
-      {{ facet_links('vendor',         'vendor_mentions',  'Vendor')      }}
-      {{ facet_links('subreddit',      'subreddit',        'Subreddit')   }}
-      {{ facet_links('type',           'type',             'Type')        }}
-    </div>
-
     <!-- Results -->
     <div>
       {% for r in results %}
@@ -273,8 +241,11 @@
             <span class="badge badge-{{ r.type }}">{{ r.type }}</span>
             {% if r.subreddit %}<span>r/{{ r.subreddit }}</span>{% endif %}
             {% if r.source_dataset %}<span style="color:#888">{{ r.source_dataset }}</span>{% endif %}
-            {% if r.sentiment_label %}
-              <span class="badge badge-{{ r.sentiment_label }}">{{ r.sentiment_label }}</span>
+            {% if r.polarity_label and r.polarity_label != 'unknown' %}
+              <span class="badge badge-{{ r.polarity_label }}">{{ r.polarity_label }}</span>
+            {% endif %}
+            {% if r.subjectivity_label and r.subjectivity_label != 'unknown' %}
+              <span class="badge badge-{{ r.subjectivity_label }}">{{ r.subjectivity_label }}</span>
             {% endif %}
             {% if r.score is defined %}<span>score {{ r.score }}</span>{% endif %}
             {% if r.created_date %}<span>{{ r.created_date[:10] }}</span>{% endif %}

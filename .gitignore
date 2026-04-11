@@ -35,3 +35,6 @@ ui/node_modules/
 
 # Dev changelogs
 Indexing_and_Searching/changelog/
+
+# Large CSV files
+*.csv

@@ -256,9 +256,10 @@ class TestHybridSearchService:
              "chunk_text": f"chunk text {i}",
              "search_text": f"text {i}", "body": f"body {i}",
              "title": "", "type": "post", "subreddit": "test",
-             "source_dataset": "test", "sentiment_label": "neutral",
-             "sentiment_score": 0.0, "model_mentions": [], "vendor_mentions": [],
-             "opinionatedness_score": 0.5, "score": 1, "created_date": ""}
+             "source_dataset": "test", "polarity_label": "neutral",
+             "polarity_confidence": 0.0, "model_mentions": [], "vendor_mentions": [],
+             "subjectivity_label": "unknown", "subjectivity_confidence": 0.0,
+             "score": 1, "created_date": ""}
             for i in ids
         ]
 
@@ -273,7 +274,8 @@ class TestHybridSearchService:
                 "unique_docs": num_found or len(ids),
                 "type": {"buckets": []},
                 "subreddit": {"buckets": []},
-                "sentiment_label": {"buckets": []},
+                "polarity_label": {"buckets": []},
+                "subjectivity_label": {"buckets": []},
                 "source_dataset": {"buckets": []},
                 "model_mentions": {"buckets": []},
                 "vendor_mentions": {"buckets": []},
@@ -385,7 +387,7 @@ class TestHybridSearchService:
         """fq filters must be passed to both lexical and vector Solr queries."""
         service = self._make_service()
 
-        fq_filter = ["sentiment_label:negative", "type:post"]
+        fq_filter = ["polarity_label:negative", "type:post"]
         lexical_resp = self._fake_solr_response(["a", "b"])
 
         captured_params = []
@@ -431,7 +433,7 @@ class TestHybridSearchService:
         for i, params in enumerate(captured_params[:2]):
             fq_value = params.get("fq", "")
             fq_str = " ".join(fq_value) if isinstance(fq_value, list) else str(fq_value)
-            assert "sentiment_label:negative" in fq_str, (
+            assert "polarity_label:negative" in fq_str, (
                 f"Call {i}: expected fq filter in params, got: {params}"
             )
         lexical_fq = captured_params[0].get("fq", [])
@@ -470,7 +472,8 @@ class TestHybridSearchService:
                 "unique_docs": 2,
                 "type": {"buckets": [{"val": "post", "count": 9, "docs": 2}]},
                 "subreddit": {"buckets": []},
-                "sentiment_label": {"buckets": []},
+                "polarity_label": {"buckets": []},
+                "subjectivity_label": {"buckets": []},
                 "source_dataset": {"buckets": []},
                 "model_mentions": {"buckets": []},
                 "vendor_mentions": {"buckets": []},
@@ -783,11 +786,12 @@ class TestChunkCollapse:
             "type": "post",
             "subreddit": "test",
             "source_dataset": "test",
-            "sentiment_label": "neutral",
-            "sentiment_score": 0.0,
+            "polarity_label": "neutral",
+            "polarity_confidence": 0.0,
+            "subjectivity_label": "unknown",
+            "subjectivity_confidence": 0.0,
             "model_mentions": [],
             "vendor_mentions": [],
-            "opinionatedness_score": 0.5,
             "score": score,
             "created_date": "",
         }
@@ -952,7 +956,7 @@ class TestChunkCollapse:
         with patch("hybrid_search.requests.get", return_value=lex_resp), \
              patch("hybrid_search.requests.post", side_effect=fake_post):
             service.search(
-                solr_q="q", fq=["sentiment_label:negative"], qf="", pf="", bq=[],
+                solr_q="q", fq=["polarity_label:negative"], qf="", pf="", bq=[],
                 sort="score desc", use_nlp=False, query_text="q",
             )
 
@@ -960,7 +964,7 @@ class TestChunkCollapse:
         post_params = captured_post_params[0]
         fq_value = post_params.get("fq", "")
         fq_str = " ".join(fq_value) if isinstance(fq_value, list) else str(fq_value)
-        assert "sentiment_label:negative" in fq_str
+        assert "polarity_label:negative" in fq_str
 
     def test_reranker_receives_document_level_candidates(self):
         """Reranker must receive one Candidate per source doc, not per chunk."""
@@ -1559,9 +1563,10 @@ class TestIntentIntegration:
             {"id": f"{i}__c0", "doc_id": i, "chunk_index": 0,
              "chunk_text": f"chunk text {i}", "search_text": f"text {i}",
              "body": f"body {i}", "title": "", "type": "post", "subreddit": "test",
-             "source_dataset": "test", "sentiment_label": "neutral",
-             "sentiment_score": 0.0, "model_mentions": [], "vendor_mentions": [],
-             "opinionatedness_score": 0.5, "score": 1, "created_date": ""}
+             "source_dataset": "test", "polarity_label": "neutral",
+             "polarity_confidence": 0.0, "model_mentions": [], "vendor_mentions": [],
+             "subjectivity_label": "unknown", "subjectivity_confidence": 0.0,
+             "score": 1, "created_date": ""}
             for i in ids
         ]
 
@@ -1574,7 +1579,8 @@ class TestIntentIntegration:
             "facets": {
                 "count": len(ids), "unique_docs": len(ids),
                 "type": {"buckets": []}, "subreddit": {"buckets": []},
-                "sentiment_label": {"buckets": []}, "source_dataset": {"buckets": []},
+                "polarity_label": {"buckets": []}, "subjectivity_label": {"buckets": []},
+                "source_dataset": {"buckets": []},
                 "model_mentions": {"buckets": []}, "vendor_mentions": {"buckets": []},
             },
             "facet_counts": {"facet_fields": {}},

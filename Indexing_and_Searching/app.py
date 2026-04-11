@@ -43,7 +43,7 @@ _hybrid   = HybridSearchService(SOLR_URL, _embedder, _reranker)
 
 
 def _build_fq(doc_type, subreddit, date_from, date_to,
-              sentiment, source_dataset, model, vendor):
+              polarity, subjectivity, source_dataset, model, vendor):
     fq = []
     if doc_type:
         fq.append(f"type:{doc_type}")
@@ -53,8 +53,10 @@ def _build_fq(doc_type, subreddit, date_from, date_to,
         d_from = (date_from + "T00:00:00Z") if date_from else "*"
         d_to   = (date_to   + "T23:59:59Z") if date_to   else "*"
         fq.append(f"created_date:[{d_from} TO {d_to}]")
-    if sentiment:
-        fq.append(f"sentiment_label:{sentiment}")
+    if polarity:
+        fq.append(f"polarity_label:{polarity}")
+    if subjectivity:
+        fq.append(f"subjectivity_label:{subjectivity}")
     if source_dataset:
         fq.append(f"source_dataset:{source_dataset}")
     if model:
@@ -206,7 +208,8 @@ def index() -> str:
     date_from      = request.args.get("date_from", "")
     date_to        = request.args.get("date_to", "")
     sort           = request.args.get("sort", "score desc")
-    sentiment      = request.args.get("sentiment", "")
+    polarity       = request.args.get("polarity", "")
+    subjectivity   = request.args.get("subjectivity", "")
     source_dataset = request.args.get("source_dataset", "")
     model          = request.args.get("model", "")
     vendor         = request.args.get("vendor", "")
@@ -238,7 +241,8 @@ def index() -> str:
                 date_from=date_from,
                 date_to=date_to,
                 sort=sort,
-                sentiment=sentiment,
+                polarity=polarity,
+                subjectivity=subjectivity,
                 source_dataset=source_dataset,
                 model=model,
                 vendor=vendor,
@@ -276,7 +280,7 @@ def index() -> str:
                 error = f"NLP enhancement failed ({type(exc).__name__}: {exc}). Falling back to basic search."
 
         fq = _build_fq(doc_type, subreddit, date_from, date_to,
-                       sentiment, source_dataset, model, vendor)
+                       polarity, subjectivity, source_dataset, model, vendor)
 
         # Build query-field weights:
         #   - search_text for combined retrieval
@@ -369,7 +373,8 @@ def index() -> str:
         date_from=date_from,
         date_to=date_to,
         sort=sort,
-        sentiment=sentiment,
+        polarity=polarity,
+        subjectivity=subjectivity,
         source_dataset=source_dataset,
         model=model,
         vendor=vendor,
