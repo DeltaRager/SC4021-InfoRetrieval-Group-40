@@ -2050,3 +2050,477 @@ class TestIntentIntegration:
 
         assert isinstance(info.intent_signals, dict)
         assert len(info.intent_signals) > 0
+
+
+# ---------------------------------------------------------------------------
+# Sentiment analytics unit tests
+# ---------------------------------------------------------------------------
+
+def _make_solr_analytics_payload(
+    total_unique_docs=10,
+    polarity_buckets=None,
+    subjectivity_buckets=None,
+    date_buckets=None,
+    polarity_missing_count=0,
+    subjectivity_missing_count=0,
+):
+    """Build a minimal Solr JSON Facet response for analytics tests."""
+    polarity_buckets = polarity_buckets or [
+        {"val": "positive", "docs": 4},
+        {"val": "negative", "docs": 3},
+        {"val": "neutral",  "docs": 2},
+        {"val": "mixed",    "docs": 1},
+    ]
+    subjectivity_buckets = subjectivity_buckets or [
+        {"val": "subjective", "docs": 6},
+        {"val": "objective",  "docs": 3},
+    ]
+    date_buckets = date_buckets or []
+
+    return {
+        "facets": {
+            "count": total_unique_docs,
+            "total_unique_docs": total_unique_docs,
+            "polarity_totals": {
+                "buckets": polarity_buckets,
+                "missing": {"docs": polarity_missing_count},
+            },
+            "subjectivity_totals": {
+                "buckets": subjectivity_buckets,
+                "missing": {"docs": subjectivity_missing_count},
+            },
+            "by_date": {
+                "buckets": date_buckets,
+            },
+        }
+    }
+
+
+def _make_analytics_service():
+    embedder = MagicMock()
+    reranker = MagicMock()
+    return HybridSearchService("http://fake:8983/solr/test/select", embedder, reranker)
+
+
+class TestSentimentAnalyticsParsing:
+    """Unit tests for get_sentiment_analytics payload parsing."""
+
+    def _run(self, payload, date_from="", date_to=""):
+        service = _make_analytics_service()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = payload
+        fake_resp.raise_for_status.return_value = None
+        with patch("hybrid_search.requests.post", return_value=fake_resp):
+            return service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[],
+                date_from=date_from, date_to=date_to,
+            )
+
+    def test_returns_dict_with_expected_keys(self):
+        result = self._run(_make_solr_analytics_payload())
+        assert set(result.keys()) == {
+            "time_buckets", "polarity_series", "subjectivity_series",
+            "polarity_totals", "subjectivity_totals", "total_docs_analysed",
+        }
+
+    def test_total_docs_analysed(self):
+        result = self._run(_make_solr_analytics_payload(total_unique_docs=42))
+        assert result["total_docs_analysed"] == 42
+
+    def test_polarity_totals_correct(self):
+        result = self._run(_make_solr_analytics_payload(
+            polarity_buckets=[
+                {"val": "positive", "docs": 5},
+                {"val": "negative", "docs": 3},
+            ]
+        ))
+        assert result["polarity_totals"]["positive"] == 5
+        assert result["polarity_totals"]["negative"] == 3
+        assert result["polarity_totals"]["neutral"] == 0
+        assert result["polarity_totals"]["mixed"] == 0
+
+    def test_subjectivity_totals_correct(self):
+        result = self._run(_make_solr_analytics_payload(
+            subjectivity_buckets=[
+                {"val": "subjective", "docs": 7},
+                {"val": "objective",  "docs": 2},
+            ]
+        ))
+        assert result["subjectivity_totals"]["subjective"] == 7
+        assert result["subjectivity_totals"]["objective"] == 2
+
+    def test_missing_labels_counted_as_unknown(self):
+        result = self._run(_make_solr_analytics_payload(
+            polarity_missing_count=3,
+            subjectivity_missing_count=2,
+        ))
+        assert result["polarity_totals"]["unknown"] == 3
+        assert result["subjectivity_totals"]["unknown"] == 2
+
+    def test_unrecognised_label_goes_to_unknown(self):
+        result = self._run(_make_solr_analytics_payload(
+            polarity_buckets=[{"val": "weird_label", "docs": 5}]
+        ))
+        assert result["polarity_totals"]["unknown"] == 5
+
+    def test_empty_time_buckets_when_no_date_data(self):
+        result = self._run(_make_solr_analytics_payload(date_buckets=[]))
+        assert result["time_buckets"] == []
+
+    def test_time_buckets_ordered_and_parsed(self):
+        date_buckets = [
+            {
+                "val": "2024-01-01T00:00:00Z",
+                "polarity": {
+                    "buckets": [{"val": "positive", "docs": 2}, {"val": "negative", "docs": 1}],
+                    "missing": {"docs": 0},
+                },
+                "subjectivity": {
+                    "buckets": [{"val": "subjective", "docs": 3}],
+                    "missing": {"docs": 0},
+                },
+            },
+            {
+                "val": "2024-02-01T00:00:00Z",
+                "polarity": {
+                    "buckets": [{"val": "neutral", "docs": 4}],
+                    "missing": {"docs": 0},
+                },
+                "subjectivity": {
+                    "buckets": [{"val": "objective", "docs": 1}],
+                    "missing": {"docs": 0},
+                },
+            },
+        ]
+        result = self._run(_make_solr_analytics_payload(date_buckets=date_buckets))
+
+        assert result["time_buckets"] == ["2024-01-01", "2024-02-01"]
+        assert result["polarity_series"]["positive"] == [2, 0]
+        assert result["polarity_series"]["negative"] == [1, 0]
+        assert result["polarity_series"]["neutral"]  == [0, 4]
+        assert result["subjectivity_series"]["subjective"] == [3, 0]
+        assert result["subjectivity_series"]["objective"]  == [0, 1]
+
+    def test_series_parallel_to_buckets(self):
+        """Every series list must have same length as time_buckets."""
+        date_buckets = [
+            {
+                "val": f"2024-0{m}-01T00:00:00Z",
+                "polarity": {"buckets": [], "missing": {"docs": 0}},
+                "subjectivity": {"buckets": [], "missing": {"docs": 0}},
+            }
+            for m in range(1, 4)
+        ]
+        result = self._run(_make_solr_analytics_payload(date_buckets=date_buckets))
+        n = len(result["time_buckets"])
+        for lbl, series in result["polarity_series"].items():
+            assert len(series) == n, f"polarity_series[{lbl!r}] length mismatch"
+        for lbl, series in result["subjectivity_series"].items():
+            assert len(series) == n, f"subjectivity_series[{lbl!r}] length mismatch"
+
+    def test_missing_per_bucket_counted_as_unknown(self):
+        date_buckets = [
+            {
+                "val": "2024-03-01T00:00:00Z",
+                "polarity": {
+                    "buckets": [{"val": "positive", "docs": 1}],
+                    "missing": {"docs": 5},
+                },
+                "subjectivity": {
+                    "buckets": [],
+                    "missing": {"docs": 2},
+                },
+            }
+        ]
+        result = self._run(_make_solr_analytics_payload(date_buckets=date_buckets))
+        assert result["polarity_series"]["unknown"] == [5]
+        assert result["subjectivity_series"]["unknown"] == [2]
+
+    def test_solr_error_returns_empty_dict(self):
+        import requests as req
+        service = _make_analytics_service()
+        with patch("hybrid_search.requests.post", side_effect=req.RequestException("down")):
+            result = service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[]
+            )
+        assert result == {}
+
+    def test_empty_facets_returns_empty_dict(self):
+        service = _make_analytics_service()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"facets": {}}
+        fake_resp.raise_for_status.return_value = None
+        with patch("hybrid_search.requests.post", return_value=fake_resp):
+            result = service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[]
+            )
+        assert result == {}
+
+    def test_daily_gap_for_short_date_range(self):
+        """Window ≤ 31 days should use daily bucket sizing (+1DAY in request)."""
+        service = _make_analytics_service()
+        captured_params = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured_params.update(data or {})
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = _make_solr_analytics_payload()
+            fake_resp.raise_for_status.return_value = None
+            return fake_resp
+
+        with patch("hybrid_search.requests.post", side_effect=fake_post):
+            service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[],
+                date_from="2024-01-01", date_to="2024-01-15",
+            )
+        assert "+1DAY" in captured_params.get("json.facet", "")
+
+    def test_monthly_gap_for_wide_date_range(self):
+        """Window > 31 days (or no dates) should use monthly bucket sizing."""
+        service = _make_analytics_service()
+        captured_params = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured_params.update(data or {})
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = _make_solr_analytics_payload()
+            fake_resp.raise_for_status.return_value = None
+            return fake_resp
+
+        with patch("hybrid_search.requests.post", side_effect=fake_post):
+            service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[],
+                date_from="2024-01-01", date_to="2024-06-30",
+            )
+        assert "+1MONTH" in captured_params.get("json.facet", "")
+
+    def test_monthly_gap_when_no_dates_given(self):
+        service = _make_analytics_service()
+        captured_params = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured_params.update(data or {})
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = _make_solr_analytics_payload()
+            fake_resp.raise_for_status.return_value = None
+            return fake_resp
+
+        with patch("hybrid_search.requests.post", side_effect=fake_post):
+            service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[]
+            )
+        assert "+1MONTH" in captured_params.get("json.facet", "")
+
+    def test_doc_ids_path_uses_star_query(self):
+        """When doc_ids is supplied the Solr query should be q=*:* not the original query."""
+        service = _make_analytics_service()
+        captured_params = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured_params.update(data or {})
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = _make_solr_analytics_payload()
+            fake_resp.raise_for_status.return_value = None
+            return fake_resp
+
+        doc_ids = ["doc1", "doc2", "doc3"]
+        with patch("hybrid_search.requests.post", side_effect=fake_post):
+            service.get_sentiment_analytics(
+                solr_q="chatgpt vs claude", fq=[], qf="", pf="", bq=[],
+                doc_ids=doc_ids,
+            )
+        assert captured_params.get("q") == "*:*", "doc_ids path must use q=*:*"
+        # The fq list should contain a doc_id filter covering all supplied ids
+        fq_list = captured_params.get("fq", [])
+        fq_str = " ".join(fq_list) if isinstance(fq_list, list) else str(fq_list)
+        for did in doc_ids:
+            assert did in fq_str, f"doc_id {did!r} missing from fq"
+
+    def test_doc_ids_path_excludes_edismax_params(self):
+        """When doc_ids is supplied, edismax-specific params must not be sent."""
+        service = _make_analytics_service()
+        captured_params = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured_params.update(data or {})
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = _make_solr_analytics_payload()
+            fake_resp.raise_for_status.return_value = None
+            return fake_resp
+
+        with patch("hybrid_search.requests.post", side_effect=fake_post):
+            service.get_sentiment_analytics(
+                solr_q="test", fq=[], qf="title^4", pf="title^8", bq=["boost_term"],
+                doc_ids=["a", "b"],
+            )
+        assert "defType" not in captured_params
+        assert "qf" not in captured_params
+        assert "bq" not in captured_params
+
+    def test_no_doc_ids_path_uses_edismax(self):
+        """Without doc_ids the fallback path must use eDisMax."""
+        service = _make_analytics_service()
+        captured_params = {}
+
+        def fake_post(url, data=None, timeout=None):
+            captured_params.update(data or {})
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = _make_solr_analytics_payload()
+            fake_resp.raise_for_status.return_value = None
+            return fake_resp
+
+        with patch("hybrid_search.requests.post", side_effect=fake_post):
+            service.get_sentiment_analytics(
+                solr_q="chatgpt", fq=[], qf="title^4", pf="title^8", bq=[],
+            )
+        assert captured_params.get("defType") == "edismax"
+        assert captured_params.get("q") == "chatgpt"
+
+
+class TestFusedDocIdsPopulation:
+    """Verify RetrievalInfo.fused_doc_ids is populated at each search() exit path."""
+
+    def _make_service(self):
+        embedder = MagicMock()
+        reranker = MagicMock()
+        return HybridSearchService("http://fake:8983/solr/test/select", embedder, reranker)
+
+    def _lex_resp(self, doc_ids):
+        docs = [{"id": did, "doc_id": did, "score": 1.0} for did in doc_ids]
+        payload = {
+            "response": {"docs": docs, "numFound": len(docs)},
+            "facets": {"count": len(docs), "total_unique_docs": len(docs)},
+        }
+        resp = MagicMock()
+        resp.json.return_value = payload
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_lexical_only_mode_populates_fused_doc_ids(self):
+        service = self._make_service()
+        lex_resp = self._lex_resp(["a", "b", "c"])
+        hl_resp = MagicMock()
+        hl_resp.json.return_value = {"response": {"docs": []}, "highlighting": {}}
+        hl_resp.raise_for_status.return_value = None
+
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, hl_resp]):
+            _, _, _, info = service.search(
+                solr_q="test", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False, query_text="test",
+                use_vector=False,
+            )
+        assert set(info.fused_doc_ids) == {"a", "b", "c"}
+
+    def test_hybrid_mode_populates_fused_doc_ids_from_reranker_output(self):
+        """fused_doc_ids should reflect the reranker top-K, including vector-only docs."""
+        service = self._make_service()
+        # Lexical returns doc "a"; vector returns docs "a" and "b" (b is vector-only)
+        lex_resp = self._lex_resp(["a"])
+
+        vec_payload = {
+            "response": {
+                "docs": [
+                    {"id": "a__c0", "doc_id": "a", "score": 0.9},
+                    {"id": "b__c0", "doc_id": "b", "score": 0.8},
+                ]
+            }
+        }
+        vec_resp = MagicMock()
+        vec_resp.json.return_value = vec_payload
+        vec_resp.raise_for_status.return_value = None
+
+        chunk_resp = MagicMock()
+        chunk_resp.json.return_value = {"response": {"docs": []}}
+        chunk_resp.raise_for_status.return_value = None
+
+        hl_resp = MagicMock()
+        hl_resp.json.return_value = {"response": {"docs": []}, "highlighting": {}}
+        hl_resp.raise_for_status.return_value = None
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1] * 1024)
+        # Reranker returns both candidates so final_ids covers a and b
+        service._reranker.rerank = MagicMock(return_value=[
+            Candidate(id="a__c0", doc_id="a", source="both",    raw_score=0.9, rerank_score=0.9),
+            Candidate(id="b__c0", doc_id="b", source="vector",  raw_score=0.8, rerank_score=0.7),
+        ])
+
+        with patch("hybrid_search.requests.get", side_effect=[lex_resp, chunk_resp, hl_resp]), \
+             patch("hybrid_search.requests.post", return_value=vec_resp):
+            _, _, _, info = service.search(
+                solr_q="test", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False, query_text="test",
+                use_vector=True,
+            )
+        # fused_doc_ids comes from final_ids (reranker output), not the full fused list
+        assert "a" in info.fused_doc_ids
+        assert "b" in info.fused_doc_ids
+        # Must not contain ids that weren't in the reranker output
+        assert len(info.fused_doc_ids) == 2
+
+
+# ---------------------------------------------------------------------------
+# Flask route-level analytics tests
+# ---------------------------------------------------------------------------
+
+class TestAppAnalyticsRoute:
+    """Route-level tests: analytics included/omitted/graceful."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_setup_check(self):
+        with patch("app._get_solr_setup_error", return_value=""):
+            yield
+
+    @pytest.fixture()
+    def client(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import app as flask_app
+        flask_app.app.config["TESTING"] = True
+        with flask_app.app.test_client() as c:
+            yield c
+
+    def _mock_search(self, results=None, facets=None, num_found=0, info=None):
+        from hybrid_search import RetrievalInfo
+        return MagicMock(return_value=(
+            results or [],
+            facets or {},
+            num_found,
+            info or RetrievalInfo(),
+        ))
+
+    def _mock_analytics(self, data=None):
+        return MagicMock(return_value=data or {
+            "time_buckets": ["2024-01"],
+            "polarity_series": {"positive": [3], "negative": [1], "neutral": [1], "mixed": [0], "unknown": [0]},
+            "subjectivity_series": {"subjective": [4], "objective": [1], "unknown": [0]},
+            "polarity_totals": {"positive": 3, "negative": 1, "neutral": 1, "mixed": 0, "unknown": 0},
+            "subjectivity_totals": {"subjective": 4, "objective": 1, "unknown": 0},
+            "total_docs_analysed": 5,
+        })
+
+    def test_analytics_included_for_query(self, client):
+        import app as flask_app
+        search_mock = self._mock_search(num_found=5)
+        analytics_mock = self._mock_analytics()
+        with patch.object(flask_app._hybrid, "search", search_mock), \
+             patch.object(flask_app._hybrid, "get_sentiment_analytics", analytics_mock):
+            resp = client.get("/?q=AI")
+        assert resp.status_code == 200
+        assert b"total_docs_analysed" in resp.data or b"Sentiment Analytics" in resp.data
+
+    def test_analytics_omitted_for_no_query(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert b"Sentiment Analytics" not in resp.data
+
+    def test_analytics_graceful_on_failure(self, client):
+        """When analytics raises, the page still renders without crashing."""
+        import app as flask_app
+        search_mock = self._mock_search(num_found=5)
+        failing_analytics = MagicMock(side_effect=Exception("boom"))
+        with patch.object(flask_app._hybrid, "search", search_mock), \
+             patch.object(flask_app._hybrid, "get_sentiment_analytics", failing_analytics):
+            resp = client.get("/?q=AI")
+        assert resp.status_code == 200
+        assert b"Sentiment Analytics" not in resp.data

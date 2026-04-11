@@ -251,6 +251,7 @@ def index() -> str:
     error = ""
     nlp_info: dict[str, Any] = {}
     retrieval_info: dict[str, Any] = {}
+    analytics: dict[str, Any] = {}
 
     if q:
         setup_error = _get_solr_setup_error(SOLR_URL)
@@ -277,6 +278,7 @@ def index() -> str:
                 facets=facets,
                 nlp_info=nlp_info,
                 retrieval_info=retrieval_info,
+                analytics=analytics,
                 error=error,
                 subreddit_options=SUBREDDIT_OPTIONS,
             )
@@ -364,6 +366,23 @@ def index() -> str:
             # not the number of results shown (pipeline caps at SEARCH_ROWS=20).
             num_found = len(results)
 
+            # Sentiment analytics — aggregates over the full fused doc_id set
+            # (lexical + vector) so charts are not limited to BM25-only results.
+            try:
+                analytics = _hybrid.get_sentiment_analytics(
+                    solr_q=solr_q,
+                    fq=fq,
+                    qf=qf,
+                    pf=pf,
+                    bq=bq_parts,
+                    date_from=date_from,
+                    date_to=date_to,
+                    doc_ids=info.fused_doc_ids or None,
+                )
+            except Exception as exc:
+                logger.warning("Sentiment analytics failed: %s", exc)
+                analytics = {}
+
             # Surface any degradation warnings as the existing error banner
             if info.degraded and info.warnings:
                 warn_text = " ".join(info.warnings)
@@ -410,6 +429,7 @@ def index() -> str:
         facets=facets,
         nlp_info=nlp_info,
         retrieval_info=retrieval_info,
+        analytics=analytics,
         error=error,
         subreddit_options=SUBREDDIT_OPTIONS,
     )

@@ -55,7 +55,35 @@
     .retrieval-badge.intent-mixed    { background: #fff3cd; color: #7c4a03; }
     .retrieval-stat { color: #6b7280; }
     .retrieval-stat b { color: #111827; }
+    /* ---- analytics popover ---- */
+    .analytics-btn { background: #ede9fe; color: #5b21b6; border: 1px solid #c4b5fd; border-radius: 6px; padding: 4px 12px; font-size: 0.85em; font-weight: 600; cursor: pointer; }
+    .analytics-btn:hover { background: #ddd6fe; }
+    .analytics-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 100; align-items: center; justify-content: center; }
+    .analytics-overlay.open { display: flex; }
+    .analytics-popover { background: #fff; border-radius: 10px; box-shadow: 0 8px 32px rgba(0,0,0,0.18); padding: 24px; width: min(860px, 94vw); max-height: 90vh; overflow-y: auto; position: relative; }
+    .analytics-popover-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+    .analytics-popover-header h2 { font-size: 1.05em; color: #374151; margin: 0; }
+    .analytics-close { background: none; border: none; font-size: 1.4em; line-height: 1; cursor: pointer; color: #6b7280; padding: 0 4px; }
+    .analytics-close:hover { color: #111; }
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .chart-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }
+    .chart-card h3 { font-size: 0.92em; color: #555; margin: 0 0 8px; }
+    .chart-card canvas { display: block; width: 100% !important; }
+    .chart-trend-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; margin-bottom: 16px; }
+    .chart-trend-card h3 { font-size: 0.92em; color: #555; margin: 0 0 8px; }
+    .chart-trend-card canvas { display: block; width: 100% !important; }
+    .analytics-empty { color: #888; font-size: 0.9em; font-style: italic; padding: 8px 0; }
+    .analytics-totals { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; font-size: 0.85em; }
+    .analytics-total-chip { padding: 3px 10px; border-radius: 12px; font-weight: 600; }
+    .atc-positive    { background: #e8f5e9; color: #2e7d32; }
+    .atc-negative    { background: #ffebee; color: #b71c1c; }
+    .atc-neutral     { background: #f5f5f5; color: #555; border: 1px solid #ddd; }
+    .atc-mixed       { background: #fff3e0; color: #e65100; }
+    .atc-subjective  { background: #fff8e1; color: #f57f17; }
+    .atc-objective   { background: #e8eaf6; color: #283593; }
+    .atc-unknown     { background: #fafafa; color: #aaa; border: 1px solid #eee; }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
 <body>
   {% macro render_concept_chips(raw_concepts, limit=8) %}
@@ -232,7 +260,208 @@
   {% endif %}
 
   {% if response_ms is not none %}
-    <div class="meta">Found <b>{{ num_found }}</b> results in <b>{{ response_ms }} ms</b>.</div>
+    <div class="meta" style="display:flex; align-items:center; gap:12px;">
+      <span>Found <b>{{ num_found }}</b> results in <b>{{ response_ms }} ms</b>.</span>
+      {% if analytics and analytics.total_docs_analysed %}
+        <button class="analytics-btn" id="analyticsOpenBtn" type="button">
+          Show sentiment graphs &mdash; {{ analytics.total_docs_analysed }} doc{{ 's' if analytics.total_docs_analysed != 1 }}
+        </button>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {# ---- Sentiment analytics popover ---- #}
+  {% if analytics and analytics.total_docs_analysed %}
+  <div class="analytics-overlay" id="analyticsOverlay" role="dialog" aria-modal="true" aria-label="Sentiment Analytics">
+    <div class="analytics-popover">
+      <div class="analytics-popover-header">
+        <h2>Sentiment Analytics &mdash; {{ analytics.total_docs_analysed }} document{{ 's' if analytics.total_docs_analysed != 1 }} analysed</h2>
+        <button class="analytics-close" id="analyticsCloseBtn" type="button" aria-label="Close">&times;</button>
+      </div>
+
+      {# Totals chips #}
+      <div class="analytics-totals">
+        {% for lbl, cnt in analytics.polarity_totals.items() %}
+          {% if cnt %}
+            <span class="analytics-total-chip atc-{{ lbl }}">{{ lbl }}: {{ cnt }}</span>
+          {% endif %}
+        {% endfor %}
+        {% for lbl, cnt in analytics.subjectivity_totals.items() %}
+          {% if cnt %}
+            <span class="analytics-total-chip atc-{{ lbl }}">{{ lbl }}: {{ cnt }}</span>
+          {% endif %}
+        {% endfor %}
+      </div>
+
+      {# Time-trend chart #}
+      {% if analytics.time_buckets | length >= 2 %}
+      <div class="chart-trend-card">
+        <h3>Polarity trend over time</h3>
+        <canvas id="chartPolarityTrend" height="120"></canvas>
+      </div>
+      {% elif analytics.time_buckets | length == 1 %}
+      <p class="analytics-empty">Only one time bucket &mdash; trend chart requires at least two data points.</p>
+      {% else %}
+      <p class="analytics-empty">No date information available for trend chart.</p>
+      {% endif %}
+
+      {# Distribution charts #}
+      <div class="charts-grid">
+        <div class="chart-card">
+          <h3>Polarity distribution</h3>
+          <canvas id="chartPolarityDist" height="160"></canvas>
+        </div>
+        <div class="chart-card">
+          <h3>Subjectivity distribution</h3>
+          <canvas id="chartSubjectivityDist" height="160"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function() {
+    var overlay   = document.getElementById("analyticsOverlay");
+    var openBtn   = document.getElementById("analyticsOpenBtn");
+    var closeBtn  = document.getElementById("analyticsCloseBtn");
+    var chartsInitialised = false;
+
+    function openPopover() {
+      overlay.classList.add("open");
+      if (!chartsInitialised) {
+        chartsInitialised = true;
+        initCharts();
+      }
+    }
+
+    function closePopover() {
+      overlay.classList.remove("open");
+    }
+
+    openBtn.addEventListener("click", openPopover);
+    closeBtn.addEventListener("click", closePopover);
+
+    // Close on backdrop click
+    overlay.addEventListener("click", function(e) {
+      if (e.target === overlay) closePopover();
+    });
+
+    // Close on Escape key
+    document.addEventListener("keydown", function(e) {
+      if (e.key === "Escape" && overlay.classList.contains("open")) closePopover();
+    });
+
+    // ---- Chart initialisation (lazy: runs only on first open) ----
+    function initCharts() {
+      var _analytics = {{ analytics | tojson }};
+
+      var PALETTE = {
+        positive:   { bg: "rgba(46,125,50,0.75)",   border: "#2e7d32" },
+        negative:   { bg: "rgba(183,28,28,0.75)",   border: "#b71c1c" },
+        neutral:    { bg: "rgba(117,117,117,0.6)",  border: "#757575" },
+        mixed:      { bg: "rgba(230,81,0,0.75)",    border: "#e65100" },
+        subjective: { bg: "rgba(245,127,23,0.75)",  border: "#f57f17" },
+        objective:  { bg: "rgba(40,53,147,0.75)",   border: "#283593" },
+        unknown:    { bg: "rgba(200,200,200,0.5)",  border: "#bdbdbd" },
+      };
+
+      function colour(lbl, prop) {
+        return (PALETTE[lbl] || PALETTE.unknown)[prop];
+      }
+
+      // --- Polarity trend (line chart) ---
+      var trendCanvas = document.getElementById("chartPolarityTrend");
+      if (trendCanvas && _analytics.time_buckets && _analytics.time_buckets.length >= 2) {
+        var trendLabels = _analytics.time_buckets;
+        var trendSeries = _analytics.polarity_series;
+        var trendDatasets = [];
+        ["positive","negative","neutral","mixed"].forEach(function(lbl) {
+          var data = trendSeries[lbl] || [];
+          var total = data.reduce(function(a,b){return a+b;}, 0);
+          if (total === 0) return;
+          trendDatasets.push({
+            label: lbl.charAt(0).toUpperCase() + lbl.slice(1),
+            data: data,
+            borderColor: colour(lbl, "border"),
+            backgroundColor: colour(lbl, "bg"),
+            tension: 0.3,
+            fill: false,
+            pointRadius: trendLabels.length > 60 ? 0 : 3,
+          });
+        });
+        new Chart(trendCanvas, {
+          type: "line",
+          data: { labels: trendLabels, datasets: trendDatasets },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { position: "top" },
+              tooltip: { mode: "index", intersect: false },
+            },
+            scales: {
+              x: { ticks: { maxTicksLimit: 12, maxRotation: 45, font: { size: 11 } } },
+              y: { beginAtZero: true, ticks: { precision: 0 } },
+            },
+          },
+        });
+      }
+
+      // --- Polarity distribution (bar chart) ---
+      var polCanvas = document.getElementById("chartPolarityDist");
+      if (polCanvas) {
+        var polTotals = _analytics.polarity_totals || {};
+        var polLabels = [], polData = [], polBg = [], polBorder = [];
+        ["positive","negative","neutral","mixed","unknown"].forEach(function(lbl){
+          var v = polTotals[lbl] || 0;
+          if (v === 0) return;
+          polLabels.push(lbl.charAt(0).toUpperCase() + lbl.slice(1));
+          polData.push(v);
+          polBg.push(colour(lbl,"bg"));
+          polBorder.push(colour(lbl,"border"));
+        });
+        new Chart(polCanvas, {
+          type: "bar",
+          data: {
+            labels: polLabels,
+            datasets: [{ label: "Documents", data: polData, backgroundColor: polBg, borderColor: polBorder, borderWidth: 1 }],
+          },
+          options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+          },
+        });
+      }
+
+      // --- Subjectivity distribution (bar chart) ---
+      var subjCanvas = document.getElementById("chartSubjectivityDist");
+      if (subjCanvas) {
+        var subjTotals = _analytics.subjectivity_totals || {};
+        var subjLabels = [], subjData = [], subjBg = [], subjBorder = [];
+        ["subjective","objective","unknown"].forEach(function(lbl){
+          var v = subjTotals[lbl] || 0;
+          if (v === 0) return;
+          subjLabels.push(lbl.charAt(0).toUpperCase() + lbl.slice(1));
+          subjData.push(v);
+          subjBg.push(colour(lbl,"bg"));
+          subjBorder.push(colour(lbl,"border"));
+        });
+        new Chart(subjCanvas, {
+          type: "bar",
+          data: {
+            labels: subjLabels,
+            datasets: [{ label: "Documents", data: subjData, backgroundColor: subjBg, borderColor: subjBorder, borderWidth: 1 }],
+          },
+          options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+          },
+        });
+      }
+    }
+  })();
+  </script>
   {% endif %}
 
   {% if results or facets %}

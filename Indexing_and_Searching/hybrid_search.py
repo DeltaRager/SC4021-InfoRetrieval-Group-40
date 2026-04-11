@@ -175,6 +175,10 @@ class RetrievalInfo:
     alpha: float = 0.5              # BM25 weight used in weighted RRF
     beta: float = 0.5               # vector weight used in weighted RRF
     intent_signals: dict[str, float] = field(default_factory=dict)
+    # Full fused doc_id list (all candidates before top-N slicing).
+    # Used by analytics so charts cover the whole matched set, not just the
+    # lexical BM25 slice.  Not included in as_dict() — template doesn't need it.
+    fused_doc_ids: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -572,6 +576,14 @@ class HybridSearchService:
         if not use_vector:
             info.mode = "lexical"
             results = self._finalize_lexical(lexical_docs, solr_q, fq, qf, sort)
+            # Populate fused_doc_ids from the lexical candidate set so analytics
+            # covers the same population as the results.
+            seen_lex_ids: set[str] = set()
+            for d in lexical_docs:
+                did = d.get("doc_id") or d.get("id")
+                if did and did not in seen_lex_ids:
+                    seen_lex_ids.add(did)
+                    info.fused_doc_ids.append(did)
             info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
             return results, facets, num_found, info
 
@@ -587,6 +599,12 @@ class HybridSearchService:
             info.mode = "lexical"
             info.warnings.append("Vector retrieval unavailable; serving lexical results only.")
             results = self._finalize_lexical(lexical_docs, solr_q, fq, qf, sort)
+            seen_lex_ids2: set[str] = set()
+            for d in lexical_docs:
+                did = d.get("doc_id") or d.get("id")
+                if did and did not in seen_lex_ids2:
+                    seen_lex_ids2.add(did)
+                    info.fused_doc_ids.append(did)
             info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
             return results, facets, num_found, info
 
@@ -639,6 +657,10 @@ class HybridSearchService:
         )
         info.latency_ms["rrf"] = round((time.perf_counter() - t0) * 1000, 1)
         info.fused_hits = len(fused)
+        # Capture the full fused doc_id list (before top-K slicing) so analytics
+        # can aggregate over the complete matched population rather than just the
+        # lexical BM25 candidates.
+        info.fused_doc_ids = [fid for fid, _ in fused]
 
         # Build doc-level metadata map from fused ranking.
         vec_docs_by_doc_id: dict[str, dict] = {d["doc_id"]: d for d in vector_docs}
@@ -755,6 +777,10 @@ class HybridSearchService:
         # what is displayed, not the wider lexical candidate pool.
         facets = _facets_from_results(results)
         info.latency_ms["highlight_fetch"] = round((time.perf_counter() - t0) * 1000, 1)
+
+        # Replace the earlier full-fused list with the reranker top-K so that
+        # analytics aggregates over exactly the same set the user sees.
+        info.fused_doc_ids = final_ids
 
         info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
         return results, facets, num_found, info
@@ -1070,6 +1096,256 @@ class HybridSearchService:
             results.append(result)
 
         return results, facets
+
+    # ------------------------------------------------------------------
+    # Sentiment analytics aggregation
+    # ------------------------------------------------------------------
+
+    def get_sentiment_analytics(
+        self,
+        solr_q: str,
+        fq: list[str],
+        qf: str,
+        pf: str,
+        bq: list[str],
+        date_from: str = "",
+        date_to: str = "",
+        doc_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate sentiment distribution for the full matched document set.
+
+        When ``doc_ids`` is provided (the full fused doc_id list from the hybrid
+        pipeline) the query uses ``q=*:* fq=doc_id:(...)`` so that vector-only
+        results are included.  Without ``doc_ids`` the query falls back to
+        replaying the lexical eDisMax query, which would miss documents that only
+        the vector path retrieved.
+
+        Bucket granularity is chosen automatically:
+          - If both ``date_from`` and ``date_to`` are supplied and the window
+            is ≤ 31 days → daily buckets (gap ``+1DAY``).
+          - Otherwise → monthly buckets (gap ``+1MONTH``).
+
+        Returns a dict with keys:
+          ``time_buckets``        ordered list of ISO date strings (bucket start)
+          ``polarity_series``     {label: [count_per_bucket, …]} for positive /
+                                  negative / neutral / mixed
+          ``subjectivity_series`` {label: [count_per_bucket, …]} for subjective /
+                                  objective
+          ``polarity_totals``     {label: total_count} across all buckets
+          ``subjectivity_totals`` {label: total_count} across all buckets
+          ``total_docs_analysed`` total unique docs matched
+        On any Solr error returns an empty dict so callers can degrade gracefully.
+        """
+        # Determine date bucket granularity.
+        gap = "+1MONTH"
+        if date_from and date_to:
+            try:
+                from datetime import date as _date
+                d_from = _date.fromisoformat(date_from)
+                d_to   = _date.fromisoformat(date_to)
+                if (d_to - d_from).days <= 31:
+                    gap = "+1DAY"
+            except ValueError:
+                pass
+
+        # Build date range bounds for the facet.  Use explicit bounds when the
+        # caller supplied them; otherwise span the full corpus.
+        facet_start = (date_from + "T00:00:00Z") if date_from else "1970-01-01T00:00:00Z"
+        facet_end   = (date_to   + "T23:59:59Z") if date_to   else "NOW"
+
+        polarity_labels     = ["positive", "negative", "neutral", "mixed"]
+        subjectivity_labels = ["subjective", "objective"]
+
+        # JSON Facet: date range with nested polarity + subjectivity terms.
+        json_facet = json.dumps({
+            "total_unique_docs": "unique(doc_id)",
+            "polarity_totals": {
+                "type": "terms",
+                "field": "polarity_label",
+                "limit": -1,
+                "mincount": 0,
+                "missing": True,
+                "facet": {"docs": "unique(doc_id)"},
+            },
+            "subjectivity_totals": {
+                "type": "terms",
+                "field": "subjectivity_label",
+                "limit": -1,
+                "mincount": 0,
+                "missing": True,
+                "facet": {"docs": "unique(doc_id)"},
+            },
+            "by_date": {
+                "type": "range",
+                "field": "created_date",
+                "start": facet_start,
+                "end": facet_end,
+                "gap": gap,
+                "mincount": 1,
+                "facet": {
+                    "polarity": {
+                        "type": "terms",
+                        "field": "polarity_label",
+                        "limit": -1,
+                        "mincount": 0,
+                        "missing": True,
+                        "facet": {"docs": "unique(doc_id)"},
+                    },
+                    "subjectivity": {
+                        "type": "terms",
+                        "field": "subjectivity_label",
+                        "limit": -1,
+                        "mincount": 0,
+                        "missing": True,
+                        "facet": {"docs": "unique(doc_id)"},
+                    },
+                },
+            },
+        }, separators=(",", ":"))
+
+        if doc_ids:
+            # Fast path: we already know exactly which source documents matched
+            # (full fused set from the hybrid pipeline).  Use q=*:* and filter
+            # by doc_id so that vector-only results are included.  Chunk records
+            # share the same doc_id as their source document, so the collapse
+            # filter still deduplicates to one row per source document.
+            # Solr has a practical limit on boolean clause length; chunk the ids
+            # into batches of 1000 to avoid URI/query-parse overflows.
+            BATCH = 1000
+            all_fq = list(fq or [])
+            if len(doc_ids) <= BATCH:
+                all_fq.append("doc_id:(" + " OR ".join(doc_ids) + ")")
+            else:
+                # More than 1000 ids: use a terms query via local-params
+                # which Solr handles more efficiently than a giant boolean.
+                terms_val = ",".join(doc_ids)
+                all_fq.append(f"{{!terms f=doc_id}}{terms_val}")
+            all_fq.append(_collapse_filter("score desc"))
+            params: dict[str, Any] = {
+                "q":          "*:*",
+                "rows":       0,
+                "wt":         "json",
+                "json.facet": json_facet,
+                "fq":         all_fq,
+            }
+        else:
+            # Fallback: replay the lexical query (misses vector-only results).
+            params = {
+                "q":          solr_q,
+                "defType":    "edismax",
+                "qf":         qf,
+                "pf":         pf,
+                "mm":         "3<75%",
+                "rows":       0,
+                "wt":         "json",
+                "json.facet": json_facet,
+            }
+            if bq:
+                params["bq"] = bq
+            all_fq = list(fq or [])
+            all_fq.append(_collapse_filter("score desc"))
+            params["fq"] = all_fq
+
+        try:
+            # POST avoids URI length limits when doc_ids produces a long fq filter.
+            resp = requests.post(self._solr_url, data=params, timeout=15)
+            resp.raise_for_status()
+            payload = resp.json()
+        except requests.RequestException as exc:
+            logger.warning("Sentiment analytics Solr query failed: %s", exc)
+            return {}
+
+        facets = payload.get("facets", {})
+        if not facets:
+            return {}
+
+        # --- totals ---
+        total_docs: int = int(facets.get("total_unique_docs", 0) or 0)
+
+        def _extract_totals(facet_node: Any, labels: list[str]) -> dict[str, int]:
+            totals: dict[str, int] = {lbl: 0 for lbl in labels}
+            totals["unknown"] = 0
+            if not isinstance(facet_node, dict):
+                return totals
+            for bucket in facet_node.get("buckets", []):
+                val   = str(bucket.get("val", "")).strip().lower()
+                count = int(bucket.get("docs", bucket.get("count", 0)) or 0)
+                if val in totals:
+                    totals[val] = count
+                else:
+                    totals["unknown"] += count
+            # missing bucket (docs with null/missing label)
+            missing_count = int(
+                (facet_node.get("missing") or {}).get("docs",
+                (facet_node.get("missing") or {}).get("count", 0)) or 0
+            )
+            totals["unknown"] += missing_count
+            return totals
+
+        polarity_totals     = _extract_totals(facets.get("polarity_totals"),     polarity_labels)
+        subjectivity_totals = _extract_totals(facets.get("subjectivity_totals"), subjectivity_labels)
+
+        # --- time series ---
+        by_date_node = facets.get("by_date", {})
+        date_buckets_raw = by_date_node.get("buckets", []) if isinstance(by_date_node, dict) else []
+
+        time_buckets: list[str] = []
+        # series: label → list of per-bucket counts (parallel to time_buckets)
+        polarity_series: dict[str, list[int]] = {lbl: [] for lbl in polarity_labels + ["unknown"]}
+        subjectivity_series: dict[str, list[int]] = {lbl: [] for lbl in subjectivity_labels + ["unknown"]}
+
+        for bucket in date_buckets_raw:
+            date_val = bucket.get("val", "")
+            if not date_val:
+                continue
+            # Normalise Solr ISO date string to a plain date prefix "YYYY-MM-DD".
+            date_str = str(date_val)[:10]
+            time_buckets.append(date_str)
+
+            # polarity
+            pol_node = bucket.get("polarity", {})
+            pol_counts: dict[str, int] = {lbl: 0 for lbl in polarity_labels + ["unknown"]}
+            for pb in (pol_node.get("buckets", []) if isinstance(pol_node, dict) else []):
+                lbl = str(pb.get("val", "")).strip().lower()
+                cnt = int(pb.get("docs", pb.get("count", 0)) or 0)
+                if lbl in pol_counts:
+                    pol_counts[lbl] = cnt
+                else:
+                    pol_counts["unknown"] += cnt
+            missing_pol = int(
+                (pol_node.get("missing") or {}).get("docs",
+                (pol_node.get("missing") or {}).get("count", 0)) or 0
+            ) if isinstance(pol_node, dict) else 0
+            pol_counts["unknown"] += missing_pol
+            for lbl in polarity_series:
+                polarity_series[lbl].append(pol_counts.get(lbl, 0))
+
+            # subjectivity
+            subj_node = bucket.get("subjectivity", {})
+            subj_counts: dict[str, int] = {lbl: 0 for lbl in subjectivity_labels + ["unknown"]}
+            for sb in (subj_node.get("buckets", []) if isinstance(subj_node, dict) else []):
+                lbl = str(sb.get("val", "")).strip().lower()
+                cnt = int(sb.get("docs", sb.get("count", 0)) or 0)
+                if lbl in subj_counts:
+                    subj_counts[lbl] = cnt
+                else:
+                    subj_counts["unknown"] += cnt
+            missing_subj = int(
+                (subj_node.get("missing") or {}).get("docs",
+                (subj_node.get("missing") or {}).get("count", 0)) or 0
+            ) if isinstance(subj_node, dict) else 0
+            subj_counts["unknown"] += missing_subj
+            for lbl in subjectivity_series:
+                subjectivity_series[lbl].append(subj_counts.get(lbl, 0))
+
+        return {
+            "time_buckets":         time_buckets,
+            "polarity_series":      polarity_series,
+            "subjectivity_series":  subjectivity_series,
+            "polarity_totals":      polarity_totals,
+            "subjectivity_totals":  subjectivity_totals,
+            "total_docs_analysed":  total_docs,
+        }
 
     def _finalize_lexical(
         self,
