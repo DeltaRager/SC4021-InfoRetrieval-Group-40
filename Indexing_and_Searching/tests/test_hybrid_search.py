@@ -2063,6 +2063,15 @@ def _make_solr_analytics_payload(
     date_buckets=None,
     polarity_missing_count=0,
     subjectivity_missing_count=0,
+    subreddit_buckets=None,
+    model_buckets=None,
+    vendor_buckets=None,
+    type_buckets=None,
+    pol_conf_bins=None,
+    subj_conf_bins=None,
+    avg_score=None,
+    min_date=None,
+    max_date=None,
 ):
     """Build a minimal Solr JSON Facet response for analytics tests."""
     polarity_buckets = polarity_buckets or [
@@ -2076,11 +2085,20 @@ def _make_solr_analytics_payload(
         {"val": "objective",  "docs": 3},
     ]
     date_buckets = date_buckets or []
+    subreddit_buckets = subreddit_buckets or []
+    model_buckets = model_buckets or []
+    vendor_buckets = vendor_buckets or []
+    type_buckets = type_buckets or []
+    pol_conf_bins = pol_conf_bins or []
+    subj_conf_bins = subj_conf_bins or []
 
     return {
         "facets": {
             "count": total_unique_docs,
             "total_unique_docs": total_unique_docs,
+            "avg_score": avg_score,
+            "min_date": min_date,
+            "max_date": max_date,
             "polarity_totals": {
                 "buckets": polarity_buckets,
                 "missing": {"docs": polarity_missing_count},
@@ -2092,6 +2110,12 @@ def _make_solr_analytics_payload(
             "by_date": {
                 "buckets": date_buckets,
             },
+            "by_subreddit": {"buckets": subreddit_buckets},
+            "by_model":     {"buckets": model_buckets},
+            "by_vendor":    {"buckets": vendor_buckets},
+            "by_type":      {"buckets": type_buckets},
+            "polarity_confidence_bins":     {"buckets": pol_conf_bins},
+            "subjectivity_confidence_bins": {"buckets": subj_conf_bins},
         }
     }
 
@@ -2103,7 +2127,7 @@ def _make_analytics_service():
 
 
 class TestSentimentAnalyticsParsing:
-    """Unit tests for get_sentiment_analytics payload parsing."""
+    """Unit tests for get_analytics payload parsing (backwards-compat keys)."""
 
     def _run(self, payload, date_from="", date_to=""):
         service = _make_analytics_service()
@@ -2111,17 +2135,19 @@ class TestSentimentAnalyticsParsing:
         fake_resp.json.return_value = payload
         fake_resp.raise_for_status.return_value = None
         with patch("hybrid_search.requests.post", return_value=fake_resp):
-            return service.get_sentiment_analytics(
+            return service.get_analytics(
                 solr_q="test", fq=[], qf="", pf="", bq=[],
                 date_from=date_from, date_to=date_to,
             )
 
-    def test_returns_dict_with_expected_keys(self):
+    def test_returns_dict_with_expected_legacy_keys(self):
+        """Legacy flat keys must still be present for backwards compatibility."""
         result = self._run(_make_solr_analytics_payload())
-        assert set(result.keys()) == {
+        legacy_keys = {
             "time_buckets", "polarity_series", "subjectivity_series",
             "polarity_totals", "subjectivity_totals", "total_docs_analysed",
         }
+        assert legacy_keys.issubset(set(result.keys()))
 
     def test_total_docs_analysed(self):
         result = self._run(_make_solr_analytics_payload(total_unique_docs=42))
@@ -2240,7 +2266,7 @@ class TestSentimentAnalyticsParsing:
         import requests as req
         service = _make_analytics_service()
         with patch("hybrid_search.requests.post", side_effect=req.RequestException("down")):
-            result = service.get_sentiment_analytics(
+            result = service.get_analytics(
                 solr_q="test", fq=[], qf="", pf="", bq=[]
             )
         assert result == {}
@@ -2251,7 +2277,7 @@ class TestSentimentAnalyticsParsing:
         fake_resp.json.return_value = {"facets": {}}
         fake_resp.raise_for_status.return_value = None
         with patch("hybrid_search.requests.post", return_value=fake_resp):
-            result = service.get_sentiment_analytics(
+            result = service.get_analytics(
                 solr_q="test", fq=[], qf="", pf="", bq=[]
             )
         assert result == {}
@@ -2269,7 +2295,7 @@ class TestSentimentAnalyticsParsing:
             return fake_resp
 
         with patch("hybrid_search.requests.post", side_effect=fake_post):
-            service.get_sentiment_analytics(
+            service.get_analytics(
                 solr_q="test", fq=[], qf="", pf="", bq=[],
                 date_from="2024-01-01", date_to="2024-01-15",
             )
@@ -2288,7 +2314,7 @@ class TestSentimentAnalyticsParsing:
             return fake_resp
 
         with patch("hybrid_search.requests.post", side_effect=fake_post):
-            service.get_sentiment_analytics(
+            service.get_analytics(
                 solr_q="test", fq=[], qf="", pf="", bq=[],
                 date_from="2024-01-01", date_to="2024-06-30",
             )
@@ -2306,7 +2332,7 @@ class TestSentimentAnalyticsParsing:
             return fake_resp
 
         with patch("hybrid_search.requests.post", side_effect=fake_post):
-            service.get_sentiment_analytics(
+            service.get_analytics(
                 solr_q="test", fq=[], qf="", pf="", bq=[]
             )
         assert "+1MONTH" in captured_params.get("json.facet", "")
@@ -2325,7 +2351,7 @@ class TestSentimentAnalyticsParsing:
 
         doc_ids = ["doc1", "doc2", "doc3"]
         with patch("hybrid_search.requests.post", side_effect=fake_post):
-            service.get_sentiment_analytics(
+            service.get_analytics(
                 solr_q="chatgpt vs claude", fq=[], qf="", pf="", bq=[],
                 doc_ids=doc_ids,
             )
@@ -2349,7 +2375,7 @@ class TestSentimentAnalyticsParsing:
             return fake_resp
 
         with patch("hybrid_search.requests.post", side_effect=fake_post):
-            service.get_sentiment_analytics(
+            service.get_analytics(
                 solr_q="test", fq=[], qf="title^4", pf="title^8", bq=["boost_term"],
                 doc_ids=["a", "b"],
             )
@@ -2370,7 +2396,7 @@ class TestSentimentAnalyticsParsing:
             return fake_resp
 
         with patch("hybrid_search.requests.post", side_effect=fake_post):
-            service.get_sentiment_analytics(
+            service.get_analytics(
                 solr_q="chatgpt", fq=[], qf="title^4", pf="title^8", bq=[],
             )
         assert captured_params.get("defType") == "edismax"
@@ -2504,15 +2530,15 @@ class TestAppAnalyticsRoute:
         search_mock = self._mock_search(num_found=5)
         analytics_mock = self._mock_analytics()
         with patch.object(flask_app._hybrid, "search", search_mock), \
-             patch.object(flask_app._hybrid, "get_sentiment_analytics", analytics_mock):
+             patch.object(flask_app._hybrid, "get_analytics", analytics_mock):
             resp = client.get("/?q=AI")
         assert resp.status_code == 200
-        assert b"total_docs_analysed" in resp.data or b"Sentiment Analytics" in resp.data
+        assert b"total_docs_analysed" in resp.data or b"Analytics" in resp.data
 
     def test_analytics_omitted_for_no_query(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert b"Sentiment Analytics" not in resp.data
+        assert b"Analytics Dashboard" not in resp.data
 
     def test_analytics_graceful_on_failure(self, client):
         """When analytics raises, the page still renders without crashing."""
@@ -2520,7 +2546,263 @@ class TestAppAnalyticsRoute:
         search_mock = self._mock_search(num_found=5)
         failing_analytics = MagicMock(side_effect=Exception("boom"))
         with patch.object(flask_app._hybrid, "search", search_mock), \
-             patch.object(flask_app._hybrid, "get_sentiment_analytics", failing_analytics):
+             patch.object(flask_app._hybrid, "get_analytics", failing_analytics):
             resp = client.get("/?q=AI")
         assert resp.status_code == 200
-        assert b"Sentiment Analytics" not in resp.data
+        assert b"Analytics Dashboard" not in resp.data
+
+
+# ---------------------------------------------------------------------------
+# Analytics dashboard payload tests
+# ---------------------------------------------------------------------------
+
+def _make_analytics_payload_full():
+    """Full analytics payload with all sections populated."""
+    return _make_solr_analytics_payload(
+        total_unique_docs=20,
+        avg_score=42.5,
+        min_date="2024-01-01T00:00:00Z",
+        max_date="2024-12-01T00:00:00Z",
+        subreddit_buckets=[
+            {"val": "MachineLearning",  "docs": 8,
+             "polarity": {"buckets": [{"val": "positive","docs":5},{"val":"negative","docs":3}], "missing":{"docs":0}}},
+            {"val": "artificial",       "docs": 6,
+             "polarity": {"buckets": [{"val": "neutral","docs":4},{"val":"mixed","docs":2}],    "missing":{"docs":0}}},
+            {"val": "ChatGPT",          "docs": 4,
+             "polarity": {"buckets": [{"val": "positive","docs":4}],                             "missing":{"docs":0}}},
+            {"val": "LocalLLaMA",       "docs": 2,
+             "polarity": {"buckets": [],                                                          "missing":{"docs":2}}},
+        ],
+        model_buckets=[
+            {"val": "chatgpt",  "docs": 10,
+             "polarity": {"buckets": [{"val":"positive","docs":7},{"val":"negative","docs":3}], "missing":{"docs":0}}},
+            {"val": "claude",   "docs":  6,
+             "polarity": {"buckets": [{"val":"positive","docs":5},{"val":"neutral","docs":1}],  "missing":{"docs":0}}},
+            {"val": "gemini",   "docs":  3,
+             "polarity": {"buckets": [{"val":"neutral","docs":3}],                              "missing":{"docs":0}}},
+        ],
+        vendor_buckets=[
+            {"val": "openai",    "docs": 12,
+             "polarity": {"buckets": [{"val":"positive","docs":8},{"val":"negative","docs":4}], "missing":{"docs":0}}},
+            {"val": "anthropic", "docs":  6,
+             "polarity": {"buckets": [{"val":"positive","docs":5},{"val":"neutral","docs":1}],  "missing":{"docs":0}}},
+        ],
+        type_buckets=[
+            {"val": "post",    "docs": 14,
+             "polarity": {"buckets": [{"val":"positive","docs":8},{"val":"negative","docs":6}], "missing":{"docs":0}}},
+            {"val": "comment", "docs": 6,
+             "polarity": {"buckets": [{"val":"neutral","docs":4},{"val":"positive","docs":2}],  "missing":{"docs":0}}},
+        ],
+        pol_conf_bins=[
+            {"val": 0.5, "docs": 4},
+            {"val": 0.6, "docs": 6},
+            {"val": 0.7, "docs": 5},
+            {"val": 0.8, "docs": 3},
+            {"val": 0.9, "docs": 2},
+        ],
+        subj_conf_bins=[
+            {"val": 0.6, "docs": 8},
+            {"val": 0.7, "docs": 7},
+            {"val": 0.8, "docs": 5},
+        ],
+    )
+
+
+class TestAnalyticsDashboardParsing:
+    """Unit tests for the expanded get_analytics dashboard payload."""
+
+    def _run(self, payload, **kwargs):
+        service = _make_analytics_service()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = payload
+        fake_resp.raise_for_status.return_value = None
+        with patch("hybrid_search.requests.post", return_value=fake_resp):
+            return service.get_analytics(
+                solr_q="test", fq=[], qf="", pf="", bq=[], **kwargs
+            )
+
+    # ---- overview section ----
+
+    def test_overview_total_docs(self):
+        result = self._run(_make_analytics_payload_full())
+        assert result["overview"]["total_docs"] == 20
+
+    def test_overview_avg_score(self):
+        result = self._run(_make_analytics_payload_full())
+        assert result["overview"]["avg_score"] == 42.5
+
+    def test_overview_date_span(self):
+        result = self._run(_make_analytics_payload_full())
+        assert result["overview"]["min_date"] == "2024-01-01"
+        assert result["overview"]["max_date"] == "2024-12-01"
+
+    def test_overview_missing_avg_score_is_none(self):
+        payload = _make_solr_analytics_payload(avg_score=None)
+        result = self._run(payload)
+        assert result["overview"]["avg_score"] is None
+
+    # ---- by_subreddit ----
+
+    def test_by_subreddit_top_n_extracted(self):
+        result = self._run(_make_analytics_payload_full())
+        subreddits = result["by_subreddit"]
+        assert len(subreddits) <= 8  # top-N default
+        labels = [s["label"] for s in subreddits]
+        assert "MachineLearning" in labels
+        assert "artificial" in labels
+
+    def test_by_subreddit_counts_correct(self):
+        result = self._run(_make_analytics_payload_full())
+        sub_map = {s["label"]: s["count"] for s in result["by_subreddit"]}
+        assert sub_map["MachineLearning"] == 8
+        assert sub_map["artificial"] == 6
+
+    def test_by_subreddit_polarity_mix_present(self):
+        result = self._run(_make_analytics_payload_full())
+        first = result["by_subreddit"][0]
+        assert "polarity_mix" in first
+        assert isinstance(first["polarity_mix"], dict)
+
+    def test_by_subreddit_polarity_mix_values(self):
+        result = self._run(_make_analytics_payload_full())
+        sub_map = {s["label"]: s["polarity_mix"] for s in result["by_subreddit"]}
+        assert sub_map["MachineLearning"]["positive"] == 5
+        assert sub_map["MachineLearning"]["negative"] == 3
+
+    def test_by_subreddit_other_rollup(self):
+        """When more buckets than top-N arrive they must be collapsed into Other."""
+        extra_buckets = [
+            {"val": f"sub{i}", "docs": 10 - i,
+             "polarity": {"buckets": [], "missing": {"docs": 0}}}
+            for i in range(12)  # 12 > top-N of 8
+        ]
+        payload = _make_solr_analytics_payload(subreddit_buckets=extra_buckets)
+        result = self._run(payload)
+        labels = [s["label"] for s in result["by_subreddit"]]
+        counts = [s["count"] for s in result["by_subreddit"]]
+        assert "Other" in labels
+        other_idx = labels.index("Other")
+        assert counts[other_idx] > 0
+
+    def test_by_subreddit_empty_when_no_data(self):
+        payload = _make_solr_analytics_payload(subreddit_buckets=[])
+        result = self._run(payload)
+        assert result["by_subreddit"] == []
+
+    # ---- by_model ----
+
+    def test_by_model_top_n_extracted(self):
+        result = self._run(_make_analytics_payload_full())
+        assert len(result["by_model"]) <= 6
+        labels = [m["label"] for m in result["by_model"]]
+        assert "chatgpt" in labels
+        assert "claude" in labels
+
+    def test_by_model_counts_correct(self):
+        result = self._run(_make_analytics_payload_full())
+        model_map = {m["label"]: m["count"] for m in result["by_model"]}
+        assert model_map["chatgpt"] == 10
+        assert model_map["claude"] == 6
+
+    def test_by_model_polarity_mix(self):
+        result = self._run(_make_analytics_payload_full())
+        model_map = {m["label"]: m["polarity_mix"] for m in result["by_model"]}
+        assert model_map["chatgpt"]["positive"] == 7
+        assert model_map["chatgpt"]["negative"] == 3
+
+    def test_by_model_other_rollup_when_overflow(self):
+        extra_models = [
+            {"val": f"model{i}", "docs": 20 - i,
+             "polarity": {"buckets": [], "missing": {"docs": 0}}}
+            for i in range(10)  # 10 > top-N of 6
+        ]
+        payload = _make_solr_analytics_payload(model_buckets=extra_models)
+        result = self._run(payload)
+        labels = [m["label"] for m in result["by_model"]]
+        assert "Other" in labels
+
+    def test_by_model_empty_when_no_data(self):
+        payload = _make_solr_analytics_payload(model_buckets=[])
+        result = self._run(payload)
+        assert result["by_model"] == []
+
+    # ---- by_vendor ----
+
+    def test_by_vendor_top_n_extracted(self):
+        result = self._run(_make_analytics_payload_full())
+        assert len(result["by_vendor"]) <= 5
+        labels = [v["label"] for v in result["by_vendor"]]
+        assert "openai" in labels
+
+    def test_by_vendor_empty_when_no_data(self):
+        payload = _make_solr_analytics_payload(vendor_buckets=[])
+        result = self._run(payload)
+        assert result["by_vendor"] == []
+
+    # ---- by_type ----
+
+    def test_by_type_post_and_comment(self):
+        result = self._run(_make_analytics_payload_full())
+        type_labels = [t["label"] for t in result["by_type"]]
+        assert "post" in type_labels
+        assert "comment" in type_labels
+
+    def test_by_type_counts(self):
+        result = self._run(_make_analytics_payload_full())
+        type_map = {t["label"]: t["count"] for t in result["by_type"]}
+        assert type_map["post"] == 14
+        assert type_map["comment"] == 6
+
+    # ---- confidence_bands ----
+
+    def test_confidence_bands_present(self):
+        result = self._run(_make_analytics_payload_full())
+        assert "confidence_bands" in result
+        assert "polarity" in result["confidence_bands"]
+        assert "subjectivity" in result["confidence_bands"]
+
+    def test_confidence_bands_polarity_bins(self):
+        result = self._run(_make_analytics_payload_full())
+        pol = result["confidence_bands"]["polarity"]
+        assert len(pol["labels"]) == 5
+        assert len(pol["counts"]) == 5
+        assert pol["counts"][0] == 4  # first bin: val=0.5, docs=4
+
+    def test_confidence_bands_subjectivity_bins(self):
+        result = self._run(_make_analytics_payload_full())
+        subj = result["confidence_bands"]["subjectivity"]
+        assert len(subj["labels"]) == 3
+        assert subj["counts"] == [8, 7, 5]
+
+    def test_confidence_band_label_format(self):
+        result = self._run(_make_analytics_payload_full())
+        pol = result["confidence_bands"]["polarity"]
+        # Each label should be a range string like "0.5–0.6"
+        for lbl in pol["labels"]:
+            assert "–" in lbl
+
+    def test_confidence_bands_empty_when_no_data(self):
+        payload = _make_solr_analytics_payload(pol_conf_bins=[], subj_conf_bins=[])
+        result = self._run(payload)
+        assert result["confidence_bands"]["polarity"]["labels"] == []
+        assert result["confidence_bands"]["subjectivity"]["counts"] == []
+
+    # ---- new structured keys alongside legacy keys ----
+
+    def test_new_sections_present(self):
+        result = self._run(_make_analytics_payload_full())
+        for key in ("overview", "sentiment", "by_subreddit", "by_model",
+                    "by_vendor", "by_type", "confidence_bands"):
+            assert key in result, f"Missing section: {key}"
+
+    def test_legacy_keys_still_present(self):
+        result = self._run(_make_analytics_payload_full())
+        for key in ("time_buckets", "polarity_series", "subjectivity_series",
+                    "polarity_totals", "subjectivity_totals", "total_docs_analysed"):
+            assert key in result, f"Missing legacy key: {key}"
+
+    def test_get_sentiment_analytics_alias_works(self):
+        """get_sentiment_analytics must be an alias for get_analytics (same function object)."""
+        from hybrid_search import HybridSearchService
+        # Compare the underlying functions (class attributes), not bound methods
+        assert HybridSearchService.get_sentiment_analytics is HybridSearchService.get_analytics

@@ -369,7 +369,7 @@ def index() -> str:
             # Sentiment analytics — aggregates over the full fused doc_id set
             # (lexical + vector) so charts are not limited to BM25-only results.
             try:
-                analytics = _hybrid.get_sentiment_analytics(
+                analytics = _hybrid.get_analytics(
                     solr_q=solr_q,
                     fq=fq,
                     qf=qf,
@@ -380,7 +380,7 @@ def index() -> str:
                     doc_ids=info.fused_doc_ids or None,
                 )
             except Exception as exc:
-                logger.warning("Sentiment analytics failed: %s", exc)
+                logger.warning("Analytics aggregation failed: %s", exc)
                 analytics = {}
 
             # Surface any degradation warnings as the existing error banner

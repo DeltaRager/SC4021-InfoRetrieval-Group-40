@@ -1098,10 +1098,17 @@ class HybridSearchService:
         return results, facets
 
     # ------------------------------------------------------------------
-    # Sentiment analytics aggregation
+    # Analytics aggregation (query-scoped dashboard)
     # ------------------------------------------------------------------
 
-    def get_sentiment_analytics(
+    # Top-N defaults for grouped breakdowns
+    _SUBREDDIT_TOP_N = 8
+    _MODEL_TOP_N     = 6
+    _VENDOR_TOP_N    = 5
+    # Minimum document count before a comparison section is shown in the UI
+    _MIN_SECTION_DOCS = 3
+
+    def get_analytics(
         self,
         solr_q: str,
         fq: list[str],
@@ -1112,31 +1119,32 @@ class HybridSearchService:
         date_to: str = "",
         doc_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Aggregate sentiment distribution for the full matched document set.
+        """Aggregate a full dashboard payload for the matched document set.
 
         When ``doc_ids`` is provided (the full fused doc_id list from the hybrid
         pipeline) the query uses ``q=*:* fq=doc_id:(...)`` so that vector-only
         results are included.  Without ``doc_ids`` the query falls back to
-        replaying the lexical eDisMax query, which would miss documents that only
-        the vector path retrieved.
+        replaying the lexical eDisMax query.
 
         Bucket granularity is chosen automatically:
           - If both ``date_from`` and ``date_to`` are supplied and the window
             is ≤ 31 days → daily buckets (gap ``+1DAY``).
           - Otherwise → monthly buckets (gap ``+1MONTH``).
 
-        Returns a dict with keys:
-          ``time_buckets``        ordered list of ISO date strings (bucket start)
-          ``polarity_series``     {label: [count_per_bucket, …]} for positive /
-                                  negative / neutral / mixed
-          ``subjectivity_series`` {label: [count_per_bucket, …]} for subjective /
-                                  objective
-          ``polarity_totals``     {label: total_count} across all buckets
-          ``subjectivity_totals`` {label: total_count} across all buckets
-          ``total_docs_analysed`` total unique docs matched
+        Returns a structured dict with sections:
+          ``overview``            total_docs, date_span, avg_score
+          ``sentiment``           polarity/subjectivity totals + time series
+          ``by_subreddit``        top-N subreddit counts + sentiment mix
+          ``by_model``            top-N model counts + sentiment mix
+          ``by_vendor``           top-N vendor counts + sentiment mix
+          ``by_type``             post vs comment volume + sentiment mix
+          ``score_bands``         fixed score ranges + polarity split
+          ``confidence_bands``    polarity/subjectivity confidence distributions
+          ``total_docs_analysed`` total unique docs matched (convenience top-level key)
+          legacy flat keys for backwards compatibility with existing template code
         On any Solr error returns an empty dict so callers can degrade gracefully.
         """
-        # Determine date bucket granularity.
+        # --- date granularity ---
         gap = "+1MONTH"
         if date_from and date_to:
             try:
@@ -1148,76 +1156,110 @@ class HybridSearchService:
             except ValueError:
                 pass
 
-        # Build date range bounds for the facet.  Use explicit bounds when the
-        # caller supplied them; otherwise span the full corpus.
         facet_start = (date_from + "T00:00:00Z") if date_from else "1970-01-01T00:00:00Z"
         facet_end   = (date_to   + "T23:59:59Z") if date_to   else "NOW"
 
         polarity_labels     = ["positive", "negative", "neutral", "mixed"]
         subjectivity_labels = ["subjective", "objective"]
 
-        # JSON Facet: date range with nested polarity + subjectivity terms.
+        # Nested polarity breakdown reused under each grouped facet
+        _nested_polarity = {
+            "type": "terms",
+            "field": "polarity_label",
+            "limit": -1,
+            "mincount": 0,
+            "missing": True,
+            "facet": {"docs": "unique(doc_id)"},
+        }
+
+        # JSON Facet payload covering all dashboard sections in a single Solr round-trip.
         json_facet = json.dumps({
+            # Scalar aggregates
             "total_unique_docs": "unique(doc_id)",
+            "avg_score": "avg(score)",
+            "min_date": "min(created_date)",
+            "max_date": "max(created_date)",
+            # Sentiment totals
             "polarity_totals": {
-                "type": "terms",
-                "field": "polarity_label",
-                "limit": -1,
-                "mincount": 0,
-                "missing": True,
+                "type": "terms", "field": "polarity_label",
+                "limit": -1, "mincount": 0, "missing": True,
                 "facet": {"docs": "unique(doc_id)"},
             },
             "subjectivity_totals": {
-                "type": "terms",
-                "field": "subjectivity_label",
-                "limit": -1,
-                "mincount": 0,
-                "missing": True,
+                "type": "terms", "field": "subjectivity_label",
+                "limit": -1, "mincount": 0, "missing": True,
                 "facet": {"docs": "unique(doc_id)"},
             },
+            # Time series
             "by_date": {
-                "type": "range",
-                "field": "created_date",
-                "start": facet_start,
-                "end": facet_end,
-                "gap": gap,
+                "type": "range", "field": "created_date",
+                "start": facet_start, "end": facet_end, "gap": gap,
                 "mincount": 1,
                 "facet": {
-                    "polarity": {
-                        "type": "terms",
-                        "field": "polarity_label",
-                        "limit": -1,
-                        "mincount": 0,
-                        "missing": True,
-                        "facet": {"docs": "unique(doc_id)"},
-                    },
+                    "polarity":     dict(_nested_polarity),
                     "subjectivity": {
-                        "type": "terms",
-                        "field": "subjectivity_label",
-                        "limit": -1,
-                        "mincount": 0,
-                        "missing": True,
+                        "type": "terms", "field": "subjectivity_label",
+                        "limit": -1, "mincount": 0, "missing": True,
                         "facet": {"docs": "unique(doc_id)"},
                     },
+                    "volume": "unique(doc_id)",
                 },
+            },
+            # Grouped breakdowns
+            "by_subreddit": {
+                "type": "terms", "field": "subreddit",
+                "limit": self._SUBREDDIT_TOP_N, "mincount": 1,
+                "facet": {
+                    "docs": "unique(doc_id)",
+                    "polarity": dict(_nested_polarity),
+                },
+            },
+            "by_model": {
+                "type": "terms", "field": "model_mentions",
+                "limit": self._MODEL_TOP_N, "mincount": 1,
+                "facet": {
+                    "docs": "unique(doc_id)",
+                    "polarity": dict(_nested_polarity),
+                },
+            },
+            "by_vendor": {
+                "type": "terms", "field": "vendor_mentions",
+                "limit": self._VENDOR_TOP_N, "mincount": 1,
+                "facet": {
+                    "docs": "unique(doc_id)",
+                    "polarity": dict(_nested_polarity),
+                },
+            },
+            "by_type": {
+                "type": "terms", "field": "type",
+                "limit": -1, "mincount": 1,
+                "facet": {
+                    "docs": "unique(doc_id)",
+                    "polarity": dict(_nested_polarity),
+                },
+            },
+            # Confidence distributions (no nesting needed — just term counts)
+            "polarity_confidence_bins": {
+                "type": "range", "field": "polarity_confidence",
+                "start": 0.0, "end": 1.0, "gap": 0.1,
+                "mincount": 1,
+                "facet": {"docs": "unique(doc_id)"},
+            },
+            "subjectivity_confidence_bins": {
+                "type": "range", "field": "subjectivity_confidence",
+                "start": 0.0, "end": 1.0, "gap": 0.1,
+                "mincount": 1,
+                "facet": {"docs": "unique(doc_id)"},
             },
         }, separators=(",", ":"))
 
+        # Build Solr query params (doc_id fast-path or lexical fallback)
+        BATCH = 1000
         if doc_ids:
-            # Fast path: we already know exactly which source documents matched
-            # (full fused set from the hybrid pipeline).  Use q=*:* and filter
-            # by doc_id so that vector-only results are included.  Chunk records
-            # share the same doc_id as their source document, so the collapse
-            # filter still deduplicates to one row per source document.
-            # Solr has a practical limit on boolean clause length; chunk the ids
-            # into batches of 1000 to avoid URI/query-parse overflows.
-            BATCH = 1000
             all_fq = list(fq or [])
             if len(doc_ids) <= BATCH:
                 all_fq.append("doc_id:(" + " OR ".join(doc_ids) + ")")
             else:
-                # More than 1000 ids: use a terms query via local-params
-                # which Solr handles more efficiently than a giant boolean.
                 terms_val = ",".join(doc_ids)
                 all_fq.append(f"{{!terms f=doc_id}}{terms_val}")
             all_fq.append(_collapse_filter("score desc"))
@@ -1229,7 +1271,6 @@ class HybridSearchService:
                 "fq":         all_fq,
             }
         else:
-            # Fallback: replay the lexical query (misses vector-only results).
             params = {
                 "q":          solr_q,
                 "defType":    "edismax",
@@ -1247,21 +1288,20 @@ class HybridSearchService:
             params["fq"] = all_fq
 
         try:
-            # POST avoids URI length limits when doc_ids produces a long fq filter.
             resp = requests.post(self._solr_url, data=params, timeout=15)
             resp.raise_for_status()
             payload = resp.json()
         except requests.RequestException as exc:
-            logger.warning("Sentiment analytics Solr query failed: %s", exc)
+            logger.warning("Analytics Solr query failed: %s", exc)
             return {}
 
         facets = payload.get("facets", {})
         if not facets:
             return {}
 
-        # --- totals ---
-        total_docs: int = int(facets.get("total_unique_docs", 0) or 0)
-
+        # ----------------------------------------------------------------
+        # Helper: extract label → count dict from a terms facet node
+        # ----------------------------------------------------------------
         def _extract_totals(facet_node: Any, labels: list[str]) -> dict[str, int]:
             totals: dict[str, int] = {lbl: 0 for lbl in labels}
             totals["unknown"] = 0
@@ -1274,7 +1314,6 @@ class HybridSearchService:
                     totals[val] = count
                 else:
                     totals["unknown"] += count
-            # missing bucket (docs with null/missing label)
             missing_count = int(
                 (facet_node.get("missing") or {}).get("docs",
                 (facet_node.get("missing") or {}).get("count", 0)) or 0
@@ -1282,15 +1321,71 @@ class HybridSearchService:
             totals["unknown"] += missing_count
             return totals
 
+        # ----------------------------------------------------------------
+        # Helper: build top-N breakdown list from a grouped terms facet node.
+        # Returns a list of dicts: [{label, count, polarity_mix}, ...]
+        # ----------------------------------------------------------------
+        def _extract_grouped(facet_node: Any, top_n: int) -> list[dict[str, Any]]:
+            if not isinstance(facet_node, dict):
+                return []
+            result: list[dict[str, Any]] = []
+            other_count = 0
+            for bucket in facet_node.get("buckets", []):
+                label = str(bucket.get("val", "")).strip()
+                if not label:
+                    continue
+                count = int(bucket.get("docs", bucket.get("count", 0)) or 0)
+                pol_node = bucket.get("polarity", {})
+                pol_mix = _extract_totals(pol_node, polarity_labels)
+                result.append({"label": label, "count": count, "polarity_mix": pol_mix})
+            # Collapse tail into "Other" if top_n < total buckets
+            if len(result) > top_n:
+                tail = result[top_n:]
+                other_count = sum(r["count"] for r in tail)
+                result = result[:top_n]
+                if other_count:
+                    result.append({"label": "Other", "count": other_count, "polarity_mix": {lbl: 0 for lbl in polarity_labels + ["unknown"]}})
+            return result
+
+        # ----------------------------------------------------------------
+        # Helper: extract confidence bin data from a range facet node.
+        # Returns {labels: [...], counts: [...]}
+        # ----------------------------------------------------------------
+        def _extract_confidence_bins(facet_node: Any) -> dict[str, Any]:
+            if not isinstance(facet_node, dict):
+                return {"labels": [], "counts": []}
+            labels: list[str] = []
+            counts: list[int] = []
+            for bucket in facet_node.get("buckets", []):
+                lo = bucket.get("val", 0.0)
+                count = int(bucket.get("docs", bucket.get("count", 0)) or 0)
+                labels.append(f"{lo:.1f}–{lo+0.1:.1f}")
+                counts.append(count)
+            return {"labels": labels, "counts": counts}
+
+        # ----------------------------------------------------------------
+        # Scalars
+        # ----------------------------------------------------------------
+        total_docs: int = int(facets.get("total_unique_docs", 0) or 0)
+        avg_score_raw = facets.get("avg_score")
+        avg_score: float | None = round(float(avg_score_raw), 2) if avg_score_raw is not None else None
+        min_date = str(facets.get("min_date", "") or "")[:10] or None
+        max_date = str(facets.get("max_date", "") or "")[:10] or None
+
+        # ----------------------------------------------------------------
+        # Sentiment totals
+        # ----------------------------------------------------------------
         polarity_totals     = _extract_totals(facets.get("polarity_totals"),     polarity_labels)
         subjectivity_totals = _extract_totals(facets.get("subjectivity_totals"), subjectivity_labels)
 
-        # --- time series ---
+        # ----------------------------------------------------------------
+        # Time series
+        # ----------------------------------------------------------------
         by_date_node = facets.get("by_date", {})
         date_buckets_raw = by_date_node.get("buckets", []) if isinstance(by_date_node, dict) else []
 
         time_buckets: list[str] = []
-        # series: label → list of per-bucket counts (parallel to time_buckets)
+        volume_series: list[int] = []
         polarity_series: dict[str, list[int]] = {lbl: [] for lbl in polarity_labels + ["unknown"]}
         subjectivity_series: dict[str, list[int]] = {lbl: [] for lbl in subjectivity_labels + ["unknown"]}
 
@@ -1298,11 +1393,10 @@ class HybridSearchService:
             date_val = bucket.get("val", "")
             if not date_val:
                 continue
-            # Normalise Solr ISO date string to a plain date prefix "YYYY-MM-DD".
             date_str = str(date_val)[:10]
             time_buckets.append(date_str)
+            volume_series.append(int(bucket.get("volume", bucket.get("count", 0)) or 0))
 
-            # polarity
             pol_node = bucket.get("polarity", {})
             pol_counts: dict[str, int] = {lbl: 0 for lbl in polarity_labels + ["unknown"]}
             for pb in (pol_node.get("buckets", []) if isinstance(pol_node, dict) else []):
@@ -1320,7 +1414,6 @@ class HybridSearchService:
             for lbl in polarity_series:
                 polarity_series[lbl].append(pol_counts.get(lbl, 0))
 
-            # subjectivity
             subj_node = bucket.get("subjectivity", {})
             subj_counts: dict[str, int] = {lbl: 0 for lbl in subjectivity_labels + ["unknown"]}
             for sb in (subj_node.get("buckets", []) if isinstance(subj_node, dict) else []):
@@ -1338,14 +1431,55 @@ class HybridSearchService:
             for lbl in subjectivity_series:
                 subjectivity_series[lbl].append(subj_counts.get(lbl, 0))
 
+        # ----------------------------------------------------------------
+        # Grouped breakdowns
+        # ----------------------------------------------------------------
+        by_subreddit = _extract_grouped(facets.get("by_subreddit"), self._SUBREDDIT_TOP_N)
+        by_model     = _extract_grouped(facets.get("by_model"),     self._MODEL_TOP_N)
+        by_vendor    = _extract_grouped(facets.get("by_vendor"),    self._VENDOR_TOP_N)
+        by_type      = _extract_grouped(facets.get("by_type"),      20)  # type has few values
+
+        # ----------------------------------------------------------------
+        # Confidence distributions
+        # ----------------------------------------------------------------
+        pol_conf_bins  = _extract_confidence_bins(facets.get("polarity_confidence_bins"))
+        subj_conf_bins = _extract_confidence_bins(facets.get("subjectivity_confidence_bins"))
+
         return {
+            # Legacy flat keys (backwards compat — template still uses these)
             "time_buckets":         time_buckets,
             "polarity_series":      polarity_series,
             "subjectivity_series":  subjectivity_series,
             "polarity_totals":      polarity_totals,
             "subjectivity_totals":  subjectivity_totals,
             "total_docs_analysed":  total_docs,
+            # New structured sections
+            "overview": {
+                "total_docs": total_docs,
+                "avg_score":  avg_score,
+                "min_date":   min_date,
+                "max_date":   max_date,
+            },
+            "sentiment": {
+                "polarity_totals":      polarity_totals,
+                "subjectivity_totals":  subjectivity_totals,
+                "time_buckets":         time_buckets,
+                "volume_series":        volume_series,
+                "polarity_series":      polarity_series,
+                "subjectivity_series":  subjectivity_series,
+            },
+            "by_subreddit": by_subreddit,
+            "by_model":     by_model,
+            "by_vendor":    by_vendor,
+            "by_type":      by_type,
+            "confidence_bands": {
+                "polarity":     pol_conf_bins,
+                "subjectivity": subj_conf_bins,
+            },
         }
+
+    # Keep the old name as an alias for callers that haven't migrated yet.
+    get_sentiment_analytics = get_analytics
 
     def _finalize_lexical(
         self,
