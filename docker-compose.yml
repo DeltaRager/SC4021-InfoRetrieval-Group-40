@@ -9,7 +9,7 @@ services:
       - solr_data:/var/solr
       - ./solr/configs:/configs
     command: >
-      solr-precreate opinions_core /configs
+      solr-precreate reddit_ai /configs
     environment:
       - SOLR_HEAP=512m
 

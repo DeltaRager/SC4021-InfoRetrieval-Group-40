@@ -17,3 +17,21 @@ SC4021 Models/
 roberta-finetuned/
 reddit_scraper_v2.py
 Indexing_and_Searching/__pycache__/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated / large data files
+Indexing_and_Searching/data/missing_vectors.json
+Indexing_and_Searching/data/missing_bitcoin_backfill.json
+Indexing_and_Searching/data/reddit_docs.json
+Indexing_and_Searching/data/reddit_docs.jsonl
+Indexing_and_Searching/data/reddit_docs_ascii.json
+
+# Frontend dependencies
+ui/node_modules/
+
+# Dev changelogs
+Indexing_and_Searching/changelog/

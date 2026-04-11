@@ -3,23 +3,43 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Reddit AI Search</title>
+  <title>AI Opinion Search</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; }
-    .filters { display: grid; grid-template-columns: repeat(6, minmax(120px,1fr)); gap: 8px; margin-bottom: 12px; }
-    input, select, button { padding: 8px; }
-    .meta { color: #555; margin: 8px 0 16px; }
-    .result { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
-    .tags { font-size: 0.9em; color: #333; margin-bottom: 8px; }
-    mark { background: #ffe082; }
-    .facet { background: #f8f8f8; padding: 8px; margin: 12px 0; border-radius: 6px; }
-    .error { color: #b00020; }
+    body       { font-family: Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; background: #f6f7f8; }
+    h1         { margin-bottom: 6px; }
+    .search-bar { display: flex; gap: 8px; margin-bottom: 10px; }
+    .search-bar input[name=q] { flex: 1; padding: 10px; font-size: 1rem; }
+    .search-bar button { padding: 10px 20px; }
+    .filters   { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
+    input, select, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    .meta      { color: #555; margin: 8px 0 14px; font-size: 0.9em; }
+    .layout    { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
+    .facet-panel { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; align-self: start; font-size: 0.88em; }
+    .facet-panel h3 { margin: 0 0 8px; font-size: 1em; }
+    .facet-group { margin-bottom: 12px; }
+    .facet-group h4 { margin: 0 0 4px; color: #444; font-size: 0.9em; text-transform: uppercase; letter-spacing: .03em; }
+    .facet-link { display: block; color: #0079d3; text-decoration: none; padding: 2px 0; }
+    .facet-link:hover { text-decoration: underline; }
+    .result    { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+    .tags      { font-size: 0.82em; color: #555; margin-bottom: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .badge     { padding: 2px 7px; border-radius: 12px; font-size: 0.8em; font-weight: 600; }
+    .badge-post    { background: #e8f5e9; color: #2e7d32; }
+    .badge-comment { background: #e3f2fd; color: #1565c0; }
+    .badge-unknown { background: #fafafa; color: #777; border: 1px solid #ddd; }
+    .badge-positive { background: #e8f5e9; color: #2e7d32; }
+    .badge-negative { background: #ffebee; color: #b71c1c; }
+    .badge-neutral  { background: #f5f5f5; color: #555; }
+    .badge-mixed    { background: #fff3e0; color: #e65100; }
+    mark       { background: #ffe082; }
+    .error     { color: #b00020; }
+    .model-tag { background: #ede7f6; color: #4527a0; padding: 2px 7px; border-radius: 12px; font-size: 0.78em; }
+    .snippet   { line-height: 1.5; color: #222; }
     .nlp-panel { background: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 8px; padding: 12px; margin: 12px 0; font-size: 0.92em; }
     .nlp-panel b { color: #2e7d32; }
     .nlp-label { display: inline-block; min-width: 140px; font-weight: 600; color: #555; }
     .concept-tag { display: inline-block; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 4px; padding: 2px 8px; margin: 2px 3px; font-size: 0.88em; color: #1565c0; }
-    .nlp-toggle { font-size: 0.88em; color: #666; margin-left: 10px; }
     .doc-concepts { margin-top: 6px; }
+    .nlp-toggle { font-size: 0.88em; color: #666; margin-bottom: 10px; }
     .auto-corrected { background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.95em; color: #1565c0; }
     .auto-corrected .original { color: #999; text-decoration: line-through; }
     .auto-corrected .corrected { color: #2e7d32; font-weight: 600; }
@@ -27,32 +47,101 @@
     .classification { margin-top: 8px; font-size: 0.9em; color: #333; }
     .classification-row { margin-top: 4px; }
     .classification-label { font-weight: 600; text-transform: capitalize; }
+    .retrieval-status { background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.88em; color: #374151; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .retrieval-status.degraded { background: #fff7ed; border-color: #fed7aa; }
+    .retrieval-badge { padding: 2px 8px; border-radius: 12px; font-weight: 600; font-size: 0.82em; }
+    .retrieval-badge.hybrid  { background: #dbeafe; color: #1d4ed8; }
+    .retrieval-badge.lexical { background: #fef9c3; color: #854d0e; }
+    .retrieval-badge.degraded { background: #fee2e2; color: #991b1b; }
+    .retrieval-badge.intent-keyword  { background: #ecfdf5; color: #065f46; }
+    .retrieval-badge.intent-semantic { background: #ede9fe; color: #5b21b6; }
+    .retrieval-badge.intent-mixed    { background: #fff3cd; color: #7c4a03; }
+    .retrieval-stat { color: #6b7280; }
+    .retrieval-stat b { color: #111827; }
   </style>
 </head>
 <body>
-  <h1>Reddit AI Search (Solr)</h1>
+  {% macro render_concept_chips(raw_concepts, limit=8) %}
+    {% if raw_concepts %}
+      {% set items = raw_concepts.split(' | ') if raw_concepts is string else raw_concepts %}
+      {% for concept in items[:limit] %}
+        {% set trimmed = concept|trim %}
+        {% if trimmed %}
+          <span class="concept-tag">{{ trimmed }}</span>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
+  {% endmacro %}
+
+  <h1>AI Opinion Search</h1>
   <form method="get">
-    <input name="q" placeholder="Search full text — supports prefix (artif) and wildcard (int*enc)" value="{{ q }}" style="width:100%; margin-bottom: 8px;" />
+    <div class="search-bar">
+      <input name="q" placeholder="Search — supports prefix (artif) and wildcard (int*enc)" value="{{ q }}" />
+      <button type="submit">Search</button>
+    </div>
     <div class="filters">
       <select name="type">
         <option value="">All types</option>
-        <option value="post" {% if doc_type == 'post' %}selected{% endif %}>Post</option>
+        <option value="post"    {% if doc_type == 'post'    %}selected{% endif %}>Post</option>
         <option value="comment" {% if doc_type == 'comment' %}selected{% endif %}>Comment</option>
+        <option value="unknown" {% if doc_type == 'unknown' %}selected{% endif %}>Unknown</option>
       </select>
-      <input name="subreddit" placeholder="Subreddit" value="{{ subreddit }}" />
+      <select name="sentiment">
+        <option value="">Any sentiment</option>
+        <option value="positive" {% if sentiment == 'positive' %}selected{% endif %}>Positive</option>
+        <option value="negative" {% if sentiment == 'negative' %}selected{% endif %}>Negative</option>
+        <option value="neutral"  {% if sentiment == 'neutral'  %}selected{% endif %}>Neutral</option>
+        <option value="mixed"    {% if sentiment == 'mixed'    %}selected{% endif %}>Mixed</option>
+      </select>
+      <select name="source_dataset">
+        <option value="">All datasets</option>
+        <option value="bitcoin"              {% if source_dataset == 'bitcoin'              %}selected{% endif %}>Bitcoin</option>
+        <option value="information_security" {% if source_dataset == 'information_security' %}selected{% endif %}>InfoSec</option>
+        <option value="seo"                  {% if source_dataset == 'seo'                  %}selected{% endif %}>SEO</option>
+        <option value="reddit_ai_sentiment"  {% if source_dataset == 'reddit_ai_sentiment'  %}selected{% endif %}>Reddit AI Sentiment</option>
+      </select>
+      <select name="model">
+        <option value="">Any model</option>
+        <option value="chatgpt"    {% if model == 'chatgpt'    %}selected{% endif %}>ChatGPT</option>
+        <option value="claude"     {% if model == 'claude'     %}selected{% endif %}>Claude</option>
+        <option value="gemini"     {% if model == 'gemini'     %}selected{% endif %}>Gemini</option>
+        <option value="llama"      {% if model == 'llama'      %}selected{% endif %}>Llama</option>
+        <option value="copilot"    {% if model == 'copilot'    %}selected{% endif %}>Copilot</option>
+        <option value="mistral"    {% if model == 'mistral'    %}selected{% endif %}>Mistral</option>
+        <option value="grok"       {% if model == 'grok'       %}selected{% endif %}>Grok</option>
+        <option value="deepseek"   {% if model == 'deepseek'   %}selected{% endif %}>DeepSeek</option>
+        <option value="perplexity" {% if model == 'perplexity' %}selected{% endif %}>Perplexity</option>
+      </select>
+      <select name="vendor">
+        <option value="">Any vendor</option>
+        <option value="openai"     {% if vendor == 'openai'     %}selected{% endif %}>OpenAI</option>
+        <option value="anthropic"  {% if vendor == 'anthropic'  %}selected{% endif %}>Anthropic</option>
+        <option value="google"     {% if vendor == 'google'     %}selected{% endif %}>Google</option>
+        <option value="meta"       {% if vendor == 'meta'       %}selected{% endif %}>Meta</option>
+        <option value="microsoft"  {% if vendor == 'microsoft'  %}selected{% endif %}>Microsoft</option>
+        <option value="xai"        {% if vendor == 'xai'        %}selected{% endif %}>xAI</option>
+        <option value="mistral_ai" {% if vendor == 'mistral_ai' %}selected{% endif %}>Mistral AI</option>
+      </select>
+      <input name="subreddit"  placeholder="Subreddit"  value="{{ subreddit }}" />
       <input type="date" name="date_from" value="{{ date_from }}" />
-      <input type="date" name="date_to" value="{{ date_to }}" />
+      <input type="date" name="date_to"   value="{{ date_to }}" />
       <select name="sort">
-        <option value="score desc" {% if sort == 'score desc' %}selected{% endif %}>Top score</option>
+        <option value="score desc"        {% if sort == 'score desc'        %}selected{% endif %}>Top score</option>
         <option value="created_date desc" {% if sort == 'created_date desc' %}selected{% endif %}>Newest</option>
       </select>
-      <button type="submit">Search</button>
     </div>
     <div class="nlp-toggle">
       <label>
         <input type="hidden" name="nlp" value="0" />
         <input type="checkbox" name="nlp" value="1" {% if use_nlp %}checked{% endif %} />
-        Enable NLP enhancement (lemmatization + concept extraction)
+        Enable NLP enhancement (lemmatization, concept extraction, spell correction, prefix/wildcard)
+      </label>
+    </div>
+    <div class="nlp-toggle">
+      <label>
+        <input type="hidden" name="vector" value="0" />
+        <input type="checkbox" name="vector" value="1" {% if use_vector %}checked{% endif %} />
+        Enable vector search (semantic similarity via embeddings)
       </label>
     </div>
   </form>
@@ -96,9 +185,45 @@
       <span class="nlp-label">After stopword removal:</span> {{ nlp_info.cleaned }}<br/>
       {% if nlp_info.concepts %}
         <span class="nlp-label">Extracted concepts:</span>
-        {% for c in nlp_info.concepts[:8] %}
-          <span class="concept-tag">{{ c }}</span>
-        {% endfor %}
+        {{ render_concept_chips(nlp_info.concepts, 8) }}
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% if retrieval_info %}
+    <div class="retrieval-status {% if retrieval_info.degraded %}degraded{% endif %}">
+      {% if retrieval_info.mode == 'hybrid' %}
+        <span class="retrieval-badge hybrid">Hybrid BM25 + Vector</span>
+      {% else %}
+        <span class="retrieval-badge lexical">Lexical BM25</span>
+      {% endif %}
+      {% if retrieval_info.degraded %}
+        <span class="retrieval-badge degraded">Degraded</span>
+      {% endif %}
+      {% if retrieval_info.lexical_hits %}
+        <span class="retrieval-stat">Lexical: <b>{{ retrieval_info.lexical_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.vector_hits %}
+        <span class="retrieval-stat">Vector: <b>{{ retrieval_info.vector_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.fused_hits %}
+        <span class="retrieval-stat">Fused: <b>{{ retrieval_info.fused_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.reranked_hits %}
+        <span class="retrieval-stat">Reranked: <b>{{ retrieval_info.reranked_hits }}</b></span>
+      {% endif %}
+      {% if retrieval_info.intent_label %}
+        <span class="retrieval-badge intent-{{ retrieval_info.intent_label }}" title="Inferred query intent">{{ retrieval_info.intent_label | capitalize }}</span>
+        <span class="retrieval-stat" title="BM25 / vector fusion weights (weighted RRF)">α={{ '%.2f'|format(retrieval_info.alpha) }} β={{ '%.2f'|format(retrieval_info.beta) }}</span>
+      {% endif %}
+      {% set lms = retrieval_info.latency_ms %}
+      {% if lms %}
+        <span class="retrieval-stat" style="margin-left:auto; color:#9ca3af; font-size:0.85em;">
+          {% if lms.lexical is defined %}lex {{ lms.lexical }}ms{% endif %}
+          {% if lms.vector is defined %} · vec {{ lms.vector }}ms{% endif %}
+          {% if lms.rrf is defined %} · rrf {{ lms.rrf }}ms{% endif %}
+          {% if lms.rerank is defined %} · rerank {{ lms.rerank }}ms{% endif %}
+        </span>
       {% endif %}
     </div>
   {% endif %}
@@ -107,18 +232,57 @@
     <div class="meta">Found <b>{{ num_found }}</b> results in <b>{{ response_ms }} ms</b>.</div>
   {% endif %}
 
-  {% if facets %}
-    <div class="facet">
-      <b>Facets</b><br/>
-      Type: {{ facets.get('type', []) }}<br/>
-      Subreddit: {{ facets.get('subreddit', []) }}
-    </div>
-  {% endif %}
+  {% if results or facets %}
+  <div class="layout">
 
-  {% for r in results %}
-    <div class="result">
-      <div class="tags">{{ r.type }} · r/{{ r.subreddit }} · score={{ r.score }} · {{ r.created_date }}</div>
-      <div>{{ r.snippet|safe }}</div>
+    <!-- Facet sidebar -->
+    <div class="facet-panel">
+      <h3>Refine results</h3>
+
+      {% macro facet_links(field_name, facet_key, label) %}
+        {% set pairs = facets.get(facet_key, []) %}
+        {% if pairs %}
+        <div class="facet-group">
+          <h4>{{ label }}</h4>
+          {% for i in range(0, pairs|length - 1, 2) %}
+            {% set val   = pairs[i] %}
+            {% set count = pairs[i+1] %}
+            {% if count > 0 %}
+              <a class="facet-link" href="?q={{ q }}&{{ field_name }}={{ val }}&type={{ doc_type }}&subreddit={{ subreddit }}&sentiment={{ sentiment }}&source_dataset={{ source_dataset }}&model={{ model }}&vendor={{ vendor }}&sort={{ sort }}">
+                {{ val }} ({{ count }})
+              </a>
+            {% endif %}
+          {% endfor %}
+        </div>
+        {% endif %}
+      {% endmacro %}
+
+      {{ facet_links('sentiment',      'sentiment_label',  'Sentiment')   }}
+      {{ facet_links('source_dataset', 'source_dataset',   'Dataset')     }}
+      {{ facet_links('model',          'model_mentions',   'AI Model')    }}
+      {{ facet_links('vendor',         'vendor_mentions',  'Vendor')      }}
+      {{ facet_links('subreddit',      'subreddit',        'Subreddit')   }}
+      {{ facet_links('type',           'type',             'Type')        }}
+    </div>
+
+    <!-- Results -->
+    <div>
+      {% for r in results %}
+        <div class="result">
+          <div class="tags">
+            <span class="badge badge-{{ r.type }}">{{ r.type }}</span>
+            {% if r.subreddit %}<span>r/{{ r.subreddit }}</span>{% endif %}
+            {% if r.source_dataset %}<span style="color:#888">{{ r.source_dataset }}</span>{% endif %}
+            {% if r.sentiment_label %}
+              <span class="badge badge-{{ r.sentiment_label }}">{{ r.sentiment_label }}</span>
+            {% endif %}
+            {% if r.score is defined %}<span>score {{ r.score }}</span>{% endif %}
+            {% if r.created_date %}<span>{{ r.created_date[:10] }}</span>{% endif %}
+            {% for m in (r.model_mentions or []) %}
+              <span class="model-tag">{{ m }}</span>
+            {% endfor %}
+          </div>
+          <div class="snippet">{{ r.snippet|safe }}</div>
       {% if r.classification %}
         <div class="classification">
           {% if r.classification.subjectivity %}
@@ -141,15 +305,18 @@
           {% endif %}
         </div>
       {% endif %}
-      {% if r.concepts %}
-        <div class="doc-concepts">
-          <small><b>Concepts:</b></small>
-          {% for c in r.concepts.split(' | ')[:6] %}
-            <span class="concept-tag">{{ c }}</span>
-          {% endfor %}
+          {% if r.concepts %}
+            <div class="doc-concepts">
+              <small><b>Concepts:</b></small>
+              {{ render_concept_chips(r.concepts, 6) }}
+            </div>
+          {% endif %}
         </div>
-      {% endif %}
+      {% endfor %}
     </div>
-  {% endfor %}
+
+  </div>
+  {% endif %}
+
 </body>
 </html>

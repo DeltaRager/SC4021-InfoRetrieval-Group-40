@@ -1,15 +1,70 @@
 {
-    "add-field": [
-      {"name":"type","type":"string","stored":true,"indexed":true},
-      {"name":"title","type":"text_en","stored":true,"indexed":true},
-      {"name":"body","type":"text_en","stored":true,"indexed":true},
-      {"name":"full_text","type":"text_en","stored":true,"indexed":true},
-      {"name":"lemmatized_text","type":"text_en","stored":true,"indexed":true},
-      {"name":"concepts","type":"text_en","stored":true,"indexed":true},
-      {"name":"subreddit","type":"string","stored":true,"indexed":true},
-      {"name":"score","type":"pint","stored":true,"indexed":true},
-      {"name":"created_date","type":"pdate","stored":true,"indexed":true},
-      {"name":"thread_id","type":"string","stored":true,"indexed":true},
-      {"name":"source_file","type":"string","stored":true,"indexed":true}
-    ]
+  "add-field": [
+    {"name": "source_id",             "type": "string",   "stored": true,  "indexed": true},
+    {"name": "source_dataset",        "type": "string",   "stored": true,  "indexed": true},
+    {"name": "source_schema",         "type": "string",   "stored": true,  "indexed": true},
+    {"name": "type",                  "type": "string",   "stored": true,  "indexed": true},
+    {"name": "title",                 "type": "text_en",  "stored": true,  "indexed": true},
+    {"name": "body",                  "type": "text_en",  "stored": true,  "indexed": true},
+    {"name": "search_text",           "type": "text_en",  "stored": true,  "indexed": true},
+    {"name": "lemmatized_text",       "type": "text_en",  "stored": true,  "indexed": true},
+    {"name": "concepts",              "type": "text_en",  "stored": true,  "indexed": true},
+    {"name": "subreddit",             "type": "string",   "stored": true,  "indexed": true},
+    {"name": "score",                 "type": "pint",     "stored": true,  "indexed": true},
+    {"name": "upvote_log",            "type": "pfloat",   "stored": true,  "indexed": true},
+    {"name": "created_date",          "type": "pdate",    "stored": true,  "indexed": true},
+    {"name": "time_bucket",           "type": "string",   "stored": true,  "indexed": true},
+    {"name": "url",                   "type": "string",   "stored": true,  "indexed": false},
+    {"name": "model_mentions",        "type": "string",   "stored": true,  "indexed": true, "multiValued": true},
+    {"name": "vendor_mentions",       "type": "string",   "stored": true,  "indexed": true, "multiValued": true},
+    {"name": "sentiment_label",       "type": "string",   "stored": true,  "indexed": true},
+    {"name": "sentiment_score",       "type": "pfloat",   "stored": true,  "indexed": true},
+    {"name": "opinionatedness_score", "type": "pfloat",   "stored": true,  "indexed": true},
+    {"name": "doc_id",                "type": "string",   "stored": true,  "indexed": true},
+    {"name": "chunk_id",              "type": "string",   "stored": true,  "indexed": true},
+    {"name": "chunk_index",           "type": "pint",     "stored": true,  "indexed": true},
+    {"name": "chunk_text",            "type": "text_en",  "stored": true,  "indexed": false},
+    {"name": "chunk_count",           "type": "pint",     "stored": true,  "indexed": false},
+    {"name": "chunk_char_start",      "type": "pint",     "stored": true,  "indexed": false},
+    {"name": "chunk_char_end",        "type": "pint",     "stored": true,  "indexed": false},
+    {"name": "chunk_concept_text",    "type": "text_en",  "stored": true,  "indexed": false},
+    {
+      "name": "chunk_vector",
+      "type": "knn_vector",
+      "stored": true,
+      "indexed": true
+    },
+    {
+      "name": "chunk_main_vector",
+      "type": "knn_vector",
+      "stored": true,
+      "indexed": false
+    },
+    {
+      "name": "chunk_concept_vector",
+      "type": "knn_vector",
+      "stored": true,
+      "indexed": false
+    }
+  ],
+
+  "add-field-type": [
+    {
+      "name":        "knn_vector",
+      "class":       "solr.DenseVectorField",
+      "vectorDimension": 1024,
+      "similarityFunction": "cosine",
+      "knnAlgorithm": "hnsw",
+      "hnswMaxConnections": 16,
+      "hnswBeamWidth":      100
+    }
+  ],
+
+  "add-copy-field": [
+    {"source": "title",          "dest": "_text_"},
+    {"source": "body",           "dest": "_text_"},
+    {"source": "search_text",    "dest": "_text_"},
+    {"source": "lemmatized_text","dest": "_text_"},
+    {"source": "concepts",       "dest": "_text_"}
+  ]
 }
