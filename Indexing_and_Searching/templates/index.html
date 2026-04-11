@@ -77,13 +77,7 @@
       <button type="submit">Search</button>
     </div>
     <div class="filters">
-      <select name="type">
-        <option value="">All types</option>
-        <option value="post"    {% if doc_type == 'post'    %}selected{% endif %}>Post</option>
-        <option value="comment" {% if doc_type == 'comment' %}selected{% endif %}>Comment</option>
-        <option value="unknown" {% if doc_type == 'unknown' %}selected{% endif %}>Unknown</option>
-      </select>
-      <select name="polarity">
+<select name="polarity">
         <option value="">Any polarity</option>
         <option value="positive" {% if polarity == 'positive' %}selected{% endif %}>Positive</option>
         <option value="negative" {% if polarity == 'negative' %}selected{% endif %}>Negative</option>
@@ -120,13 +114,24 @@
         <option value="xai"        {% if vendor == 'xai'        %}selected{% endif %}>xAI</option>
         <option value="mistral_ai" {% if vendor == 'mistral_ai' %}selected{% endif %}>Mistral AI</option>
       </select>
-      <input name="subreddit"  placeholder="Subreddit"  value="{{ subreddit }}" />
-      <input type="date" name="date_from" value="{{ date_from }}" />
-      <input type="date" name="date_to"   value="{{ date_to }}" />
-      <select name="sort">
-        <option value="score desc"        {% if sort == 'score desc'        %}selected{% endif %}>Top score</option>
-        <option value="created_date desc" {% if sort == 'created_date desc' %}selected{% endif %}>Newest</option>
+      <select name="subreddit">
+        <option value="">All subreddits</option>
+        {% for sr in subreddit_options %}
+          <option value="{{ sr }}" {% if subreddit == sr %}selected{% endif %}>
+            {%- if sr.startswith('r/') %}{{ sr }}{% else %}r/{{ sr }}{% endif -%}
+          </option>
+        {% endfor %}
       </select>
+      <div style="grid-column: 1 / -1; display: flex; gap: 8px;">
+        <input type="date" name="date_from" value="{{ date_from }}" />
+        <input type="date" name="date_to"   value="{{ date_to }}" />
+      </div>
+      <div style="grid-column: 1 / -1; display: flex; gap: 8px;">
+        <select name="sort" style="min-width: 150px;">
+          <option value="score desc"        {% if sort == 'score desc'        %}selected{% endif %}>Top score</option>
+          <option value="created_date desc" {% if sort == 'created_date desc' %}selected{% endif %}>Newest</option>
+        </select>
+      </div>
     </div>
     <div class="nlp-toggle">
       <label>
@@ -238,8 +243,7 @@
       {% for r in results %}
         <div class="result">
           <div class="tags">
-            <span class="badge badge-{{ r.type }}">{{ r.type }}</span>
-            {% if r.subreddit %}<span>r/{{ r.subreddit }}</span>{% endif %}
+{% if r.subreddit %}<span>{% if r.subreddit.startswith('r/') %}{{ r.subreddit }}{% else %}r/{{ r.subreddit }}{% endif %}</span>{% endif %}
             {% if r.source_dataset %}<span style="color:#888">{{ r.source_dataset }}</span>{% endif %}
             {% if r.polarity_label and r.polarity_label != 'unknown' %}
               <span class="badge badge-{{ r.polarity_label }}">{{ r.polarity_label }}</span>

@@ -1,3 +1,4 @@
+import csv
 import logging
 import math
 import os
@@ -35,6 +36,28 @@ REQUIRED_SOLR_FIELDS = {
     "vendor_mentions",
 }
 SAFE_TERM_RE = re.compile(r"^[\w*~.-]+$", re.ASCII)
+
+_CLASSIFIED_CSV = os.path.join(
+    os.path.dirname(__file__), "mega_ai_posts_comments_classified.csv"
+)
+
+
+def _load_subreddit_options(csv_path: str) -> list[str]:
+    """Return distinct subreddit values from the classified CSV, sorted case-insensitively."""
+    seen: set[str] = set()
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                val = (row.get("Subreddit the post/comment is from") or "").strip()
+                if val:
+                    seen.add(val)
+    except FileNotFoundError:
+        logger.warning("Classified CSV not found at %s; subreddit dropdown will be empty.", csv_path)
+    return sorted(seen, key=lambda s: s.lstrip("r/").lower())
+
+
+SUBREDDIT_OPTIONS: list[str] = _load_subreddit_options(_CLASSIFIED_CSV)
 
 # Module-level service singletons (created once at import time).
 _embedder = EmbeddingClient()
@@ -255,6 +278,7 @@ def index() -> str:
                 nlp_info=nlp_info,
                 retrieval_info=retrieval_info,
                 error=error,
+                subreddit_options=SUBREDDIT_OPTIONS,
             )
 
         # ---- NLP query enhancement ----
@@ -387,6 +411,7 @@ def index() -> str:
         nlp_info=nlp_info,
         retrieval_info=retrieval_info,
         error=error,
+        subreddit_options=SUBREDDIT_OPTIONS,
     )
 
 

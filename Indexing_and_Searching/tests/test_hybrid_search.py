@@ -22,6 +22,7 @@ from hybrid_search import (
     RetrievalInfo,
     reciprocal_rank_fusion,
     _combine_vectors as hs_combine_vectors,
+    _sort_policy,
 )
 from query_intent import infer_intent, QueryIntentProfile
 from scripts.prepare_solr_docs import (
@@ -517,6 +518,345 @@ class TestHybridSearchService:
         fq_str = " ".join(fq_value) if isinstance(fq_value, list) else str(fq_value)
         assert "doc_id:(a OR b)" in fq_str
         assert "collapse field=doc_id" in fq_str
+
+
+# ---------------------------------------------------------------------------
+# Sort policy unit tests
+# ---------------------------------------------------------------------------
+
+class TestSortPolicy:
+    def test_score_desc_is_relevance(self):
+        assert _sort_policy("score desc") == "relevance"
+
+    def test_created_date_desc_is_recency(self):
+        assert _sort_policy("created_date desc") == "recency"
+
+    def test_empty_sort_is_relevance(self):
+        assert _sort_policy("") == "relevance"
+
+    def test_unknown_sort_is_relevance(self):
+        assert _sort_policy("upvotes desc") == "relevance"
+
+
+# ---------------------------------------------------------------------------
+# Vector mode sort tests
+# ---------------------------------------------------------------------------
+
+class TestVectorModeSortSemantics:
+    """Tests that verify sort semantics for the vector/hybrid pipeline."""
+
+    SOLR_URL = "http://fake-solr:8983/solr/test_core/select"
+
+    def _make_service(self):
+        return HybridSearchService(self.SOLR_URL, EmbeddingClient(), RerankerClient())
+
+    def _make_solr_docs_with_dates(self, entries):
+        """entries: list of (id, created_date) tuples."""
+        docs = []
+        for eid, date in entries:
+            docs.append({
+                "id": f"{eid}__c0", "doc_id": eid, "chunk_index": 0,
+                "chunk_text": f"chunk text {eid}",
+                "search_text": f"text {eid}", "body": f"body {eid}",
+                "title": "", "type": "post", "subreddit": "test",
+                "source_dataset": "test", "polarity_label": "neutral",
+                "polarity_confidence": 0.0, "model_mentions": [], "vendor_mentions": [],
+                "subjectivity_label": "unknown", "subjectivity_confidence": 0.0,
+                "score": 1, "created_date": date,
+            })
+        return docs
+
+    def _fake_solr_response_with_dates(self, entries, num_found=None):
+        docs = self._make_solr_docs_with_dates(entries)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "response": {"docs": docs, "numFound": num_found or len(docs)},
+            "facets": {
+                "count": num_found or len(docs),
+                "unique_docs": num_found or len(docs),
+                "type": {"buckets": []},
+                "subreddit": {"buckets": []},
+                "polarity_label": {"buckets": []},
+                "subjectivity_label": {"buckets": []},
+                "source_dataset": {"buckets": []},
+                "model_mentions": {"buckets": []},
+                "vendor_mentions": {"buckets": []},
+            },
+            "facet_counts": {"facet_fields": {}},
+            "highlighting": {},
+        }
+        return resp
+
+    def test_vector_score_desc_preserves_rerank_order(self):
+        """sort=score desc in vector mode → results ordered by rerank/RRF score."""
+        service = self._make_service()
+
+        # Lexical: a, b, c  /  Vector: c, d  → RRF fuses all four
+        entries = [("a", "2024-01-01"), ("b", "2024-06-01"), ("c", "2023-01-01"), ("d", "2024-12-01")]
+        lexical_resp = self._fake_solr_response_with_dates(entries[:3])
+        vector_resp  = self._fake_solr_response_with_dates(entries[2:])
+        highlight_resp = self._fake_solr_response_with_dates(entries)
+        chunk_expand_resp = self._fake_solr_response_with_dates(entries)
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2, 0.3])
+
+        # Assign rerank scores: d > c > b > a (opposite of any date order)
+        def fake_rerank(query, candidates, top_k=50):
+            scores = {"a": 0.1, "b": 0.3, "c": 0.7, "d": 0.9}
+            for cand in candidates:
+                cand.rerank_score = scores.get(cand.doc_id, 0.5)
+            return sorted(candidates, key=lambda x: x.rerank_score, reverse=True)
+
+        service._reranker.rerank = fake_rerank
+
+        with patch("hybrid_search.requests.get",
+                   side_effect=[lexical_resp, chunk_expand_resp, highlight_resp]), \
+             patch("hybrid_search.requests.post", return_value=vector_resp):
+            results, _, _, info = service.search(
+                solr_q="q", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False, query_text="q",
+            )
+
+        # Results are keyed by the order of final_ids passed to _fetch_with_highlighting.
+        # highlight_resp returns docs in the order we built them, but _fetch_with_highlighting
+        # iterates `doc_ids` (final_ids) so the result order reflects the candidate order.
+        # Rerank order: d, c, b, a → first result should be d or c (highest rerank scores).
+        result_ids = [r["doc_id"] for r in results]
+        # d has highest rerank score; it must appear before a (lowest score)
+        assert result_ids.index("d") < result_ids.index("a"), (
+            f"Expected d before a in score desc order; got {result_ids}"
+        )
+
+    def test_vector_created_date_desc_orders_by_date(self):
+        """sort=created_date desc in vector mode → candidates reordered newest-first."""
+        service = self._make_service()
+
+        # Four docs with different dates
+        entries = [("a", "2024-01-01"), ("b", "2024-06-01"), ("c", "2023-01-01"), ("d", "2024-12-01")]
+        lexical_resp = self._fake_solr_response_with_dates(entries[:3])
+        vector_resp  = self._fake_solr_response_with_dates(entries[2:])
+        highlight_resp = self._fake_solr_response_with_dates(entries)
+        chunk_expand_resp = self._fake_solr_response_with_dates(entries)
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2, 0.3])
+
+        # Rerank scores intentionally different from date order
+        def fake_rerank(query, candidates, top_k=50):
+            scores = {"a": 0.9, "b": 0.7, "c": 0.5, "d": 0.3}
+            for cand in candidates:
+                cand.rerank_score = scores.get(cand.doc_id, 0.4)
+            return sorted(candidates, key=lambda x: x.rerank_score, reverse=True)
+
+        service._reranker.rerank = fake_rerank
+
+        with patch("hybrid_search.requests.get",
+                   side_effect=[lexical_resp, chunk_expand_resp, highlight_resp]), \
+             patch("hybrid_search.requests.post", return_value=vector_resp):
+            results, _, _, info = service.search(
+                solr_q="q", fq=[], qf="", pf="", bq=[],
+                sort="created_date desc", use_nlp=False, query_text="q",
+            )
+
+        result_ids = [r["doc_id"] for r in results]
+        # Expected date order: d (2024-12-01) > b (2024-06-01) > a (2024-01-01) > c (2023-01-01)
+        assert result_ids.index("d") < result_ids.index("b"), (
+            f"Expected d before b in date desc order; got {result_ids}"
+        )
+        assert result_ids.index("b") < result_ids.index("c"), (
+            f"Expected b before c in date desc order; got {result_ids}"
+        )
+        assert result_ids.index("a") < result_ids.index("c"), (
+            f"Expected a before c in date desc order; got {result_ids}"
+        )
+
+    def test_vector_created_date_tie_broken_by_semantic_score(self):
+        """When two docs share the same date, higher rerank score wins."""
+        service = self._make_service()
+
+        # a and b share the same date; c is older
+        entries = [("a", "2024-06-01"), ("b", "2024-06-01"), ("c", "2023-01-01")]
+        lexical_resp = self._fake_solr_response_with_dates(entries[:2])
+        vector_resp  = self._fake_solr_response_with_dates(entries[1:])
+        highlight_resp = self._fake_solr_response_with_dates(entries)
+        chunk_expand_resp = self._fake_solr_response_with_dates(entries)
+
+        service._embedder.embed_query = MagicMock(return_value=[0.1, 0.2])
+
+        # b has higher rerank score than a (same date)
+        def fake_rerank(query, candidates, top_k=50):
+            scores = {"a": 0.4, "b": 0.9, "c": 0.6}
+            for cand in candidates:
+                cand.rerank_score = scores.get(cand.doc_id, 0.5)
+            return sorted(candidates, key=lambda x: x.rerank_score, reverse=True)
+
+        service._reranker.rerank = fake_rerank
+
+        with patch("hybrid_search.requests.get",
+                   side_effect=[lexical_resp, chunk_expand_resp, highlight_resp]), \
+             patch("hybrid_search.requests.post", return_value=vector_resp):
+            results, _, _, info = service.search(
+                solr_q="q", fq=[], qf="", pf="", bq=[],
+                sort="created_date desc", use_nlp=False, query_text="q",
+            )
+
+        result_ids = [r["doc_id"] for r in results]
+        # b and a share the same date; b has higher score → b before a
+        assert result_ids.index("b") < result_ids.index("a"), (
+            f"Expected b before a (tie-break by score); got {result_ids}"
+        )
+        # both 2024 docs before the 2023 doc
+        assert result_ids.index("a") < result_ids.index("c") or \
+               result_ids.index("b") < result_ids.index("c"), (
+            f"Expected 2024 docs before c (2023); got {result_ids}"
+        )
+
+    def test_highlight_fetch_collapse_uses_score_desc_for_top_score(self):
+        """_fetch_with_highlighting with sort=score desc collapses with score desc."""
+        service = self._make_service()
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "response": {"docs": [], "numFound": 0},
+            "highlighting": {},
+            "facet_counts": {"facet_fields": {}},
+        }
+        captured_params: list[dict] = []
+
+        def fake_get(url, params, timeout):
+            captured_params.append(dict(params) if not isinstance(params, list) else
+                                   {k: v for k, v in params})
+            return resp
+
+        with patch("hybrid_search.requests.get", side_effect=fake_get):
+            service._fetch_with_highlighting(
+                ["a", "b"], "q", [], "", "", [], False, sort="score desc"
+            )
+
+        fq_value = captured_params[0].get("fq", [])
+        fq_str = " ".join(fq_value) if isinstance(fq_value, list) else str(fq_value)
+        assert 'sort="score desc"' in fq_str, (
+            f"Expected score desc collapse; got: {fq_str}"
+        )
+
+    def test_highlight_fetch_collapse_uses_created_date_desc_for_newest(self):
+        """_fetch_with_highlighting with sort=created_date desc collapses with created_date desc."""
+        service = self._make_service()
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {
+            "response": {"docs": [], "numFound": 0},
+            "highlighting": {},
+            "facet_counts": {"facet_fields": {}},
+        }
+        captured_params: list[dict] = []
+
+        def fake_get(url, params, timeout):
+            captured_params.append(dict(params) if not isinstance(params, list) else
+                                   {k: v for k, v in params})
+            return resp
+
+        with patch("hybrid_search.requests.get", side_effect=fake_get):
+            service._fetch_with_highlighting(
+                ["a", "b"], "q", [], "", "", [], False, sort="created_date desc"
+            )
+
+        fq_value = captured_params[0].get("fq", [])
+        fq_str = " ".join(fq_value) if isinstance(fq_value, list) else str(fq_value)
+        assert 'sort="created_date desc"' in fq_str, (
+            f"Expected created_date desc collapse; got: {fq_str}"
+        )
+
+    def test_degraded_lexical_fallback_threads_sort(self):
+        """When vector is unavailable, _finalize_lexical passes sort to highlight fetch."""
+        service = self._make_service()
+        service._embedder.embed_query = MagicMock(return_value=None)
+
+        entries = [("a", "2024-01-01"), ("b", "2024-12-01")]
+        lexical_resp = self._fake_solr_response_with_dates(entries)
+        highlight_resp = self._fake_solr_response_with_dates(entries)
+        captured_params: list[dict] = []
+
+        original_fetch = service._fetch_with_highlighting
+
+        def capturing_fetch(doc_ids, solr_q, fq, qf, pf, bq, use_nlp,
+                            pipeline_scores=None, sort="score desc"):
+            captured_params.append({"sort": sort})
+            return original_fetch(doc_ids, solr_q, fq, qf, pf, bq, use_nlp,
+                                  pipeline_scores, sort)
+
+        service._fetch_with_highlighting = capturing_fetch
+
+        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, highlight_resp]):
+            service.search(
+                solr_q="q", fq=[], qf="", pf="", bq=[],
+                sort="created_date desc", use_nlp=False, query_text="q",
+            )
+
+        assert any(p["sort"] == "created_date desc" for p in captured_params), (
+            f"Expected created_date desc to be threaded through; got: {captured_params}"
+        )
+
+    def test_lexical_only_mode_score_desc_unchanged(self):
+        """use_vector=False + sort=score desc behaves exactly as before (regression)."""
+        service = self._make_service()
+
+        entries = [("a", "2024-01-01"), ("b", "2024-12-01")]
+        lexical_resp = self._fake_solr_response_with_dates(entries)
+        highlight_resp = self._fake_solr_response_with_dates(entries)
+        captured_params: list[dict] = []
+
+        original_fetch = service._fetch_with_highlighting
+
+        def capturing_fetch(doc_ids, solr_q, fq, qf, pf, bq, use_nlp,
+                            pipeline_scores=None, sort="score desc"):
+            captured_params.append({"sort": sort, "doc_ids": list(doc_ids)})
+            return original_fetch(doc_ids, solr_q, fq, qf, pf, bq, use_nlp,
+                                  pipeline_scores, sort)
+
+        service._fetch_with_highlighting = capturing_fetch
+
+        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, highlight_resp]):
+            results, _, _, info = service.search(
+                solr_q="q", fq=[], qf="", pf="", bq=[],
+                sort="score desc", use_nlp=False, query_text="q",
+                use_vector=False,
+            )
+
+        assert info.mode == "lexical"
+        assert any(p["sort"] == "score desc" for p in captured_params), (
+            f"Expected score desc; got: {captured_params}"
+        )
+
+    def test_lexical_only_mode_created_date_desc_regression(self):
+        """use_vector=False + sort=created_date desc threads sort to highlight fetch."""
+        service = self._make_service()
+
+        entries = [("a", "2024-01-01"), ("b", "2024-12-01")]
+        lexical_resp = self._fake_solr_response_with_dates(entries)
+        highlight_resp = self._fake_solr_response_with_dates(entries)
+        captured_params: list[dict] = []
+
+        original_fetch = service._fetch_with_highlighting
+
+        def capturing_fetch(doc_ids, solr_q, fq, qf, pf, bq, use_nlp,
+                            pipeline_scores=None, sort="score desc"):
+            captured_params.append({"sort": sort})
+            return original_fetch(doc_ids, solr_q, fq, qf, pf, bq, use_nlp,
+                                  pipeline_scores, sort)
+
+        service._fetch_with_highlighting = capturing_fetch
+
+        with patch("hybrid_search.requests.get", side_effect=[lexical_resp, highlight_resp]):
+            service.search(
+                solr_q="q", fq=[], qf="", pf="", bq=[],
+                sort="created_date desc", use_nlp=False, query_text="q",
+                use_vector=False,
+            )
+
+        assert any(p["sort"] == "created_date desc" for p in captured_params), (
+            f"Expected created_date desc; got: {captured_params}"
+        )
 
 
 # ---------------------------------------------------------------------------

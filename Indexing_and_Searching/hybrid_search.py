@@ -452,6 +452,18 @@ def _facets_from_results(results: list[dict]) -> dict[str, list]:
     return facets
 
 
+def _sort_policy(sort: str) -> str:
+    """Normalise the requested sort into one of two canonical policies.
+
+    Returns:
+        "recency"   – order final results by ``created_date desc``
+        "relevance" – order final results by pipeline score desc (default)
+    """
+    if sort and "created_date" in sort:
+        return "recency"
+    return "relevance"
+
+
 def _collapse_filter(sort: str = "score desc") -> str:
     escaped_sort = sort.replace("\\", "\\\\").replace('"', '\\"')
     return f'{{!collapse field=doc_id sort="{escaped_sort}"}}'
@@ -559,7 +571,7 @@ class HybridSearchService:
         # Stage 2: vector retrieval (chunk-level kNN → collapsed to doc_id)
         if not use_vector:
             info.mode = "lexical"
-            results = self._finalize_lexical(lexical_docs, solr_q, fq, qf)
+            results = self._finalize_lexical(lexical_docs, solr_q, fq, qf, sort)
             info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
             return results, facets, num_found, info
 
@@ -574,7 +586,7 @@ class HybridSearchService:
             info.degraded = True
             info.mode = "lexical"
             info.warnings.append("Vector retrieval unavailable; serving lexical results only.")
-            results = self._finalize_lexical(lexical_docs, solr_q, fq, qf)
+            results = self._finalize_lexical(lexical_docs, solr_q, fq, qf, sort)
             info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
             return results, facets, num_found, info
 
@@ -707,10 +719,28 @@ class HybridSearchService:
 
         info.reranked_hits = len(reranked)
 
-        # Stage 5: fetch final docs with highlighting from Solr
+        # Stage 5: apply requested sort to the final candidate set, then fetch
+        # docs with highlighting from Solr.
         # final_ids are doc_ids (stable source-document ids), so the id filter
         # must match against the doc_id field for chunk records.
         t0 = time.perf_counter()
+
+        if _sort_policy(sort) == "recency":
+            # Re-order candidates by created_date desc; semantic score is the tie-breaker.
+            def _parse_date(cand: Candidate) -> str:
+                # ISO-8601 date strings sort lexicographically; missing/empty sorts last.
+                date_val = cand.display_fields.get("created_date", "")
+                return date_val if date_val else ""
+
+            reranked = sorted(
+                reranked,
+                key=lambda c: (
+                    _parse_date(c),
+                    c.rerank_score if c.rerank_score != 0.0 else c.rrf_score,
+                ),
+                reverse=True,
+            )
+
         final_candidates = reranked
         final_ids = [c.doc_id for c in final_candidates]
         # Build a score map: prefer rerank score; fall back to RRF score.
@@ -719,7 +749,7 @@ class HybridSearchService:
             for c in final_candidates
         }
         results, _ = self._fetch_with_highlighting(
-            final_ids, solr_q, fq, qf, pf, bq, use_nlp, pipeline_scores
+            final_ids, solr_q, fq, qf, pf, bq, use_nlp, pipeline_scores, sort
         )
         # Compute facets from the actual result set so sidebar counts match
         # what is displayed, not the wider lexical candidate pool.
@@ -957,6 +987,7 @@ class HybridSearchService:
         bq: list[str],
         use_nlp: bool,
         pipeline_scores: dict[str, float] | None = None,
+        sort: str = "score desc",
     ) -> tuple[list[dict], dict]:
         """Fetch one representative chunk record per doc_id with highlighting.
 
@@ -964,12 +995,20 @@ class HybridSearchService:
         the stable source identity lives in the `doc_id` field.  We filter on
         `doc_id` and pick the chunk with chunk_index=0 (the first/canonical
         chunk) for display, falling back to whichever chunk Solr returns first.
+
+        ``sort`` controls which chunk is picked as the representative when a
+        document has multiple chunks:
+          - ``score desc``        → highest-scoring chunk (relevance)
+          - ``created_date desc`` → chunk from the most recent date bucket
         """
         if not doc_ids:
             return [], {}
 
+        # For the collapse filter use the requested sort so the representative
+        # chunk matches what the user asked for.
+        collapse_sort = "created_date desc" if _sort_policy(sort) == "recency" else "score desc"
         id_filter = "doc_id:(" + " OR ".join(doc_ids) + ")"
-        all_fq = (fq or []) + [id_filter, _collapse_filter("score desc")]
+        all_fq = (fq or []) + [id_filter, _collapse_filter(collapse_sort)]
 
         # Use q=*:* so that all doc_ids are guaranteed to be returned regardless
         # of lexical match strength (vector-only results would otherwise be
@@ -1038,10 +1077,13 @@ class HybridSearchService:
         solr_q: str,
         fq: list[str],
         qf: str = "",
+        sort: str = "score desc",
     ) -> list[dict]:
         """Attach snippets to lexical docs (used in degraded mode).
 
         Lexical docs may be chunk records; collapse to unique doc_ids first.
+        ``sort`` is threaded through to ``_fetch_with_highlighting`` so the
+        representative chunk collapse honours the requested sort order.
         """
         seen: set[str] = set()
         unique_doc_ids: list[str] = []
@@ -1061,7 +1103,7 @@ class HybridSearchService:
             if did and did not in lexical_scores:
                 lexical_scores[did] = float(d.get("score", 0.0))
 
-        results, _ = self._fetch_with_highlighting(unique_doc_ids, solr_q, fq, qf, "", [], False, lexical_scores)
+        results, _ = self._fetch_with_highlighting(unique_doc_ids, solr_q, fq, qf, "", [], False, lexical_scores, sort)
         if results:
             return results
         # Fallback: return raw docs without highlights (de-duplicated by doc_id)
