@@ -27,11 +27,24 @@
     {"name": "chunk_count",           "type": "pint",     "stored": true,  "indexed": false},
     {"name": "chunk_char_start",      "type": "pint",     "stored": true,  "indexed": false},
     {"name": "chunk_char_end",        "type": "pint",     "stored": true,  "indexed": false},
+    {"name": "chunk_concept_text",    "type": "text_en",  "stored": true,  "indexed": false},
     {
       "name": "chunk_vector",
       "type": "knn_vector",
       "stored": true,
       "indexed": true
+    },
+    {
+      "name": "chunk_main_vector",
+      "type": "knn_vector",
+      "stored": true,
+      "indexed": false
+    },
+    {
+      "name": "chunk_concept_vector",
+      "type": "knn_vector",
+      "stored": true,
+      "indexed": false
     }
   ],
 

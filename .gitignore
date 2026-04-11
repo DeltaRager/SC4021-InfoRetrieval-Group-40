@@ -16,8 +16,12 @@ __pycache__/
 # Generated / large data files
 Indexing_and_Searching/data/missing_vectors.json
 Indexing_and_Searching/data/missing_bitcoin_backfill.json
+Indexing_and_Searching/data/reddit_docs.json
 Indexing_and_Searching/data/reddit_docs.jsonl
 Indexing_and_Searching/data/reddit_docs_ascii.json
+
+# Frontend dependencies
+ui/node_modules/
 
 # Dev changelogs
 Indexing_and_Searching/changelog/

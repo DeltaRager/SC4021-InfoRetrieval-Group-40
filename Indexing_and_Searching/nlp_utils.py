@@ -264,6 +264,53 @@ def extract_concepts(text: str) -> list[str]:
     return merged
 
 
+def build_concept_text(concepts: list[str]) -> str:
+    """Join a concepts list into a single string for embedding.
+
+    Concepts are joined with spaces so the embedding model treats the
+    concatenation as a natural-language sequence rather than a
+    pipe-delimited string.  Returns an empty string when concepts is empty.
+
+    This is the *concept channel* text (``b`` / ``b'`` in the dual-path
+    formula ``sim(f(a+b) + f(b), f(a'+b') + f(b'))``).
+    """
+    return " ".join(concepts) if concepts else ""
+
+
+def build_non_concept_text(text: str, concepts: list[str]) -> str:
+    """Remove recognised concept spans from *text* and return the remainder.
+
+    Each concept phrase is removed from the text in a case-insensitive,
+    whole-word-boundary-aware manner.  Consecutive whitespace left behind is
+    collapsed.
+
+    The result is the *non-concept channel* (``a`` / ``a'``) and is intended
+    for validation and offline experiments, **not** for the main embedding
+    channel (which always uses the original text ``a+b``).
+
+    Notes
+    -----
+    - Concept spans may overlap; each is removed independently in extraction
+      order, which is deterministic (YAKE → noun chunks → NER).
+    - If a concept appears multiple times in the text all occurrences are
+      removed.
+    - Returns the original text unchanged when ``concepts`` is empty.
+    """
+    if not text or not concepts:
+        return text
+
+    result = text
+    for phrase in concepts:
+        # Escape for regex and wrap in word-boundary anchors so we don't
+        # accidentally carve out substrings of longer tokens.
+        pattern = r"(?<!\w)" + _re.escape(phrase) + r"(?!\w)"
+        result = _re.sub(pattern, " ", result, flags=_re.IGNORECASE)
+
+    # Collapse runs of whitespace introduced by removal
+    result = _re.sub(r"\s+", " ", result).strip()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Smart Stopword Removal
 # ---------------------------------------------------------------------------
@@ -616,18 +663,54 @@ def preprocess_query(query: str) -> dict[str, Any]:
         "has_expansion": bool(expansions),
     }
 
+def extract_query_pos_features(text: str) -> dict[str, Any]:
+    """Return POS-derived features for a query string using spaCy.
+
+    Detects lexical verbs (VERB) and auxiliaries (AUX) that indicate
+    sentence or question structure.  Empty/punctuation-only tokens are
+    excluded.  Designed to be called defensively – callers should catch
+    exceptions and fall back to ``pos_available=False``.
+
+    Returns a dict with:
+        has_verb      : bool       -- True if at least one verb token found
+        verb_count    : int        -- number of verb/aux tokens
+        verb_lemmas   : list[str]  -- lemma of each detected verb (for diagnostics)
+        pos_available : bool       -- always True when this function succeeds
+    """
+    nlp = _get_nlp()
+    doc = nlp(text)
+    verb_lemmas: list[str] = []
+    for token in doc:
+        if not token.text.strip() or token.is_punct:
+            continue
+        if token.pos_ in ("VERB", "AUX"):
+            verb_lemmas.append(token.lemma_.lower())
+    return {
+        "has_verb": len(verb_lemmas) > 0,
+        "verb_count": len(verb_lemmas),
+        "verb_lemmas": verb_lemmas,
+        "pos_available": True,
+    }
+
+
 def process_for_indexing(text: str) -> dict[str, Any]:
     """Run the full NLP pipeline on a document's text for Solr indexing.
 
     Returns a dict with:
-        lemmatized_text : str   -- lemmatized version of the input
-        concepts        : str   -- pipe-separated list of extracted concepts
+        lemmatized_text  : str  -- lemmatized version of the input
+        concepts         : str  -- pipe-separated list of extracted concepts
+        concept_text     : str  -- concepts joined with spaces (embedding channel b')
+        non_concept_text : str  -- original text with concept spans removed (diagnostic)
     """
     lemmatized = lemmatize_text(text)
     concepts = extract_concepts(text)
+    concept_text = build_concept_text(concepts)
+    non_concept_text = build_non_concept_text(text, concepts)
     return {
         "lemmatized_text": lemmatized,
         "concepts": " | ".join(concepts),
+        "concept_text": concept_text,
+        "non_concept_text": non_concept_text,
     }
 
 
@@ -673,6 +756,12 @@ def process_query(query: str) -> dict[str, Any]:
     # 4. Build fuzzy query from the ORIGINAL input (safety net)
     fuzzy = build_fuzzy_query(query)
 
+    # 5. Build dual-path embedding texts.
+    #    main_text_for_embedding = f(a+b): the fully corrected query (original
+    #    text with concepts still present, i.e. the full query channel).
+    #    concept_text = f(b): only the extracted concepts, joined for embedding.
+    concept_text = build_concept_text(concepts)
+
     return {
         "original": query,
         "expanded": expanded_q,
@@ -686,4 +775,7 @@ def process_query(query: str) -> dict[str, Any]:
         "lemmatized": lemmatized,
         "cleaned": cleaned,
         "concepts": concepts,
+        # Dual-path embedding channels
+        "main_text_for_embedding": corrected_q,   # a+b: full corrected query
+        "concept_text": concept_text,              # b: concept channel only
     }

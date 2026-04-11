@@ -6,6 +6,22 @@ Architecture:
   RerankerClient   – thin HTTP adapter for the reranker service  (:8082)
   HybridSearchService – orchestrates lexical + vector → RRF → rerank pipeline
 
+Vector retrieval uses a dual-path composition formula:
+  query_combined_vector = normalize(main_weight * f(a+b) + concept_weight * f(b))
+where:
+  f(a+b) = embedding of the full query text (main channel)
+  f(b)   = embedding of extracted concepts only (concept channel)
+  main_weight    = VECTOR_MAIN_WEIGHT    (default 1.0, env-configurable)
+  concept_weight = VECTOR_CONCEPT_WEIGHT (default 0.2, env-configurable)
+
+Document chunks are indexed with the analogous weighted formula:
+  chunk_vector = normalize(main_weight * chunk_main_vector + concept_weight * chunk_concept_vector)
+
+This makes concept-heavy queries and documents mutually reinforcing without
+requiring a separate kNN field or online reweighting at query time.
+The concept weight < 1.0 ensures that generic concepts (e.g., "AI") do not
+dominate over the full-text embedding for semantically weak matches.
+
 Vector retrieval operates on chunk records (one Solr doc per chunk).
 Chunk hits are collapsed to source documents by `doc_id` before RRF fusion.
 Lexical retrieval and all result rendering remain document-oriented.
@@ -22,12 +38,15 @@ Config (env vars with defaults):
   SEARCH_ROWS          20    (used only in degraded/lexical-only path)
   EMBED_BATCH_SIZE     32
   EMBEDDING_DIM        1024
+  VECTOR_MAIN_WEIGHT   1.0   (weight for main/full-text embedding in combined vector)
+  VECTOR_CONCEPT_WEIGHT 0.2  (weight for concept embedding; lower = less concept dominance)
 """
 
 from __future__ import annotations
 
 import logging
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -54,6 +73,13 @@ HYBRID_RERANK_TOP_K   = int(os.getenv("HYBRID_RERANK_TOP_K",   "50"))
 SEARCH_ROWS           = int(os.getenv("SEARCH_ROWS",            "20"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE",  "32"))
 EMBEDDING_DIM    = int(os.getenv("EMBEDDING_DIM",     "1024"))
+
+# ---------------------------------------------------------------------------
+# Dual-path vector combination weights (env-var overridable)
+# ---------------------------------------------------------------------------
+
+VECTOR_MAIN_WEIGHT    = float(os.getenv("VECTOR_MAIN_WEIGHT",    "1.0"))
+VECTOR_CONCEPT_WEIGHT = float(os.getenv("VECTOR_CONCEPT_WEIGHT", "0.2"))
 
 # ---------------------------------------------------------------------------
 # Query intent weight config (env-var overridable, alpha + beta must = 1.0)
@@ -83,6 +109,37 @@ def _validate_intent_weights() -> None:
 
 
 _validate_intent_weights()
+
+
+# ---------------------------------------------------------------------------
+# Vector utilities
+# ---------------------------------------------------------------------------
+
+def _combine_vectors(
+    main_vec: list[float],
+    concept_vec: list[float],
+    main_weight: float = VECTOR_MAIN_WEIGHT,
+    concept_weight: float = VECTOR_CONCEPT_WEIGHT,
+) -> list[float]:
+    """Weighted elementwise combination of two vectors, L2-normalised.
+
+    Implements the dual-path combination formula:
+        combined = normalize(main_weight * f(a+b) + concept_weight * f(b))
+
+    The default weights (main=1.0, concept=0.2) keep the full-text embedding
+    as the primary signal while giving the concept channel a secondary boost.
+    Equal weights (1.0, 1.0) reproduce the previous equal-weight behaviour.
+
+    If the concept vector is all zeros (no concepts present) the result is
+    the normalised scaled main vector.  Returns the zero vector in the
+    degenerate case where the weighted sum is the zero vector.
+    """
+    dim = len(main_vec)
+    summed = [main_weight * main_vec[i] + concept_weight * concept_vec[i] for i in range(dim)]
+    norm = math.sqrt(sum(v * v for v in summed))
+    if norm == 0.0:
+        return summed
+    return [v / norm for v in summed]
 
 
 # ---------------------------------------------------------------------------
@@ -467,8 +524,16 @@ class HybridSearchService:
         use_nlp: bool,
         query_text: str,
         use_vector: bool = True,
+        concept_text: str = "",
     ) -> tuple[list[dict], dict, int, RetrievalInfo]:
         """Run the full hybrid pipeline.
+
+        Args:
+            concept_text: Concepts-only text for the dual-path query vector
+                          (embedding channel b = f(b)).  Derived by joining
+                          extracted concept phrases with spaces.  When empty,
+                          the combined query vector reduces to the normalised
+                          main embedding.
 
         Returns:
             (results, facets, num_found, retrieval_info)
@@ -492,12 +557,14 @@ class HybridSearchService:
         # Stage 2: vector retrieval (chunk-level kNN → collapsed to doc_id)
         if not use_vector:
             info.mode = "lexical"
-            results = self._finalize_lexical(lexical_docs, solr_q, fq)
+            results = self._finalize_lexical(lexical_docs, solr_q, fq, qf)
             info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
             return results, facets, num_found, info
 
         t0 = time.perf_counter()
-        vector_docs, best_chunk_texts = self._vector_retrieval(query_text, fq)
+        vector_docs, best_chunk_texts = self._vector_retrieval(
+            query_text, fq, concept_text=concept_text
+        )
         info.latency_ms["vector"] = round((time.perf_counter() - t0) * 1000, 1)
 
         if vector_docs is None:
@@ -505,7 +572,7 @@ class HybridSearchService:
             info.degraded = True
             info.mode = "lexical"
             info.warnings.append("Vector retrieval unavailable; serving lexical results only.")
-            results = self._finalize_lexical(lexical_docs, solr_q, fq)
+            results = self._finalize_lexical(lexical_docs, solr_q, fq, qf)
             info.latency_ms["total"] = round((time.perf_counter() - t_total) * 1000, 1)
             return results, facets, num_found, info
 
@@ -592,8 +659,16 @@ class HybridSearchService:
         info.latency_ms["chunk_expand"] = round((time.perf_counter() - t0) * 1000, 1)
 
         # Stage 4b: rerank all chunks, then max-pool to doc level.
+        # Build concept-aware reranker query text so the cross-encoder sees the
+        # same concept split that the embedding stage used.
+        if concept_text and concept_text.strip():
+            reranker_query = f"{query_text}\nConcepts: {concept_text}"
+        else:
+            reranker_query = query_text
         t0 = time.perf_counter()
-        reranked_chunks = self._reranker.rerank(query_text, chunk_pool, top_k=HYBRID_RERANK_CHUNK_K)
+        reranked_chunks = self._reranker.rerank(
+            reranker_query, chunk_pool, top_k=HYBRID_RERANK_CHUNK_K
+        )
         info.latency_ms["rerank"] = round((time.perf_counter() - t0) * 1000, 1)
 
         if reranked_chunks is None:
@@ -672,7 +747,7 @@ class HybridSearchService:
             "defType": "edismax",
             "qf":      qf,
             "pf":      pf,
-            "mm":      "2<75%",
+            "mm":      "3<75%",
             "fl":      DISPLAY_FIELDS,
             "rows":    HYBRID_LEXICAL_K,
             "start":   0,
@@ -699,8 +774,18 @@ class HybridSearchService:
         self,
         query_text: str,
         fq: list[str],
+        concept_text: str = "",
     ) -> tuple[list[dict] | None, dict[str, str]]:
         """Embed query and issue Solr kNN query against chunk_vector.
+
+        Uses the dual-path composition formula:
+            query_combined = normalize(f(a+b) + f(b))
+        where:
+            f(a+b) = embedding of the full query text (query_text)
+            f(b)   = embedding of the concept-only text (concept_text)
+
+        When concept_text is empty, f(b) is the zero vector and the combined
+        vector reduces to the normalised main embedding.
 
         Collapses chunk hits to one representative record per source document
         (best chunk score wins).
@@ -710,9 +795,23 @@ class HybridSearchService:
               - collapsed_docs is a list of one doc per unique doc_id (None on failure)
               - best_chunk_texts maps doc_id → best-matching chunk_text
         """
-        embedding = self._embedder.embed_query(query_text)
-        if embedding is None:
+        main_embedding = self._embedder.embed_query(query_text)
+        if main_embedding is None:
             return None, {}
+
+        dim = len(main_embedding)
+
+        if concept_text and concept_text.strip():
+            concept_embedding = self._embedder.embed_query(concept_text)
+            if concept_embedding is None:
+                logger.warning(
+                    "Concept embedding failed; falling back to main-only query vector."
+                )
+                concept_embedding = [0.0] * dim
+        else:
+            concept_embedding = [0.0] * dim
+
+        embedding = _combine_vectors(main_embedding, concept_embedding)
 
         vec_str = "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
         params: dict[str, Any] = {
@@ -780,7 +879,7 @@ class HybridSearchService:
         id_filter = "doc_id:(" + " OR ".join(doc_ids) + ")"
         params: dict[str, Any] = {
             "q":    "*:*",
-            "fl":   "id,doc_id,score,chunk_text,chunk_index,search_text",
+            "fl":   "id,doc_id,score,chunk_text,chunk_concept_text,chunk_index,search_text",
             "rows": HYBRID_RERANK_CHUNK_K,
             "wt":   "json",
             "fq":   id_filter,
@@ -793,6 +892,16 @@ class HybridSearchService:
             logger.warning("Chunk fetch for reranking failed: %s", exc)
             chunk_hits = []
 
+        def _reranker_doc_text(chunk_text: str, chunk_concept_text: str) -> str:
+            """Build concept-aware document text for the cross-encoder reranker.
+
+            Appends a compact concept section so the reranker sees the same
+            concept signal that was used during dual-path embedding.
+            """
+            if chunk_concept_text and chunk_concept_text.strip():
+                return f"{chunk_text}\nConcepts: {chunk_concept_text}"
+            return chunk_text
+
         if not chunk_hits:
             # Fallback: one candidate per doc using the representative record
             candidates = []
@@ -800,13 +909,15 @@ class HybridSearchService:
                 doc = lex_docs_by_doc_id.get(did) or vec_docs_by_doc_id.get(did)
                 if doc is None:
                     continue
+                chunk_text = doc.get("chunk_text", "") or doc.get("search_text", "")
+                chunk_concept_text = doc.get("chunk_concept_text", "")
                 candidates.append(Candidate(
                     id=doc.get("id", did),
                     doc_id=did,
                     source=fused_source.get(did, "lexical"),
                     raw_score=float(doc.get("score", 0.0)),
                     rrf_score=fused_rrf.get(did, 0.0),
-                    search_text=doc.get("chunk_text", "") or doc.get("search_text", ""),
+                    search_text=_reranker_doc_text(chunk_text, chunk_concept_text),
                     display_fields=doc,
                 ))
             return candidates
@@ -814,20 +925,22 @@ class HybridSearchService:
         # Build one Candidate per chunk.
         # display_fields is taken from the in-memory representative record for
         # the doc (title, body, metadata etc.) — chunk records only add
-        # chunk_text and chunk_index on top.
+        # chunk_text/chunk_concept_text and chunk_index on top.
         candidates = []
         for chunk in chunk_hits:
             did = chunk.get("doc_id") or chunk.get("id")
             if not did:
                 continue
             doc = lex_docs_by_doc_id.get(did) or vec_docs_by_doc_id.get(did) or chunk
+            chunk_text = chunk.get("chunk_text", "") or chunk.get("search_text", "")
+            chunk_concept_text = chunk.get("chunk_concept_text", "")
             candidates.append(Candidate(
                 id=chunk.get("id", did),
                 doc_id=did,
                 source=fused_source.get(did, "lexical"),
                 raw_score=float(chunk.get("score", doc.get("score", 0.0))),
                 rrf_score=fused_rrf.get(did, 0.0),
-                search_text=chunk.get("chunk_text", "") or chunk.get("search_text", ""),
+                search_text=_reranker_doc_text(chunk_text, chunk_concept_text),
                 display_fields=doc,
             ))
         return candidates
@@ -858,17 +971,22 @@ class HybridSearchService:
 
         # Use q=*:* so that all doc_ids are guaranteed to be returned regardless
         # of lexical match strength (vector-only results would otherwise be
-        # dropped by the mm minimum-match filter).  Pass the original query via
-        # hl.q so highlighting still marks relevant terms in the snippet.
+        # dropped by the mm minimum-match filter).  Build hl.q using the
+        # standard lucene parser with explicit field targeting — edismax as
+        # hl.qparser does not reliably apply hl.qf in all Solr versions.
+        hl_fields = ("search_text", "body", "title")
+        if solr_q and solr_q.strip() and solr_q.strip() != "*:*":
+            hl_q = " OR ".join(f"{f}:({solr_q})" for f in hl_fields)
+        else:
+            hl_q = solr_q or "*:*"
         params: dict[str, Any] = {
             "q":       "*:*",
             "fl":      DISPLAY_FIELDS + ",chunk_index",
             "rows":    len(doc_ids),
             "wt":      "json",
             "hl":      "true",
-            "hl.q":    solr_q,
-            "hl.qparser": "edismax",
-            "hl.fl":   "search_text,body,title,lemmatized_text,concepts",
+            "hl.q":    hl_q,
+            "hl.fl":   "search_text,body,title",
             "hl.simple.pre":  "<mark>",
             "hl.simple.post": "</mark>",
             "fq":      all_fq,
@@ -917,6 +1035,7 @@ class HybridSearchService:
         lexical_docs: list[dict],
         solr_q: str,
         fq: list[str],
+        qf: str = "",
     ) -> list[dict]:
         """Attach snippets to lexical docs (used in degraded mode).
 
@@ -940,7 +1059,7 @@ class HybridSearchService:
             if did and did not in lexical_scores:
                 lexical_scores[did] = float(d.get("score", 0.0))
 
-        results, _ = self._fetch_with_highlighting(unique_doc_ids, solr_q, fq, "", "", [], False, lexical_scores)
+        results, _ = self._fetch_with_highlighting(unique_doc_ids, solr_q, fq, qf, "", [], False, lexical_scores)
         if results:
             return results
         # Fallback: return raw docs without highlights (de-duplicated by doc_id)

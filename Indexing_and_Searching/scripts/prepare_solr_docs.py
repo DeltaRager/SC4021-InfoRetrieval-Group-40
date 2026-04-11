@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
@@ -36,18 +37,22 @@ import pandas as pd
 # Make project root importable so we can use nlp_utils and hybrid_search
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
-    from nlp_utils import process_for_indexing  # noqa: E402
+    from nlp_utils import process_for_indexing, build_concept_text  # noqa: E402
     _NLP_AVAILABLE = True
 except ImportError:
     _NLP_AVAILABLE = False
+    def build_concept_text(concepts):  # type: ignore[misc]
+        return ""
 
 try:
-    from hybrid_search import EmbeddingClient, EMBED_BATCH_SIZE  # noqa: E402
+    from hybrid_search import EmbeddingClient, EMBED_BATCH_SIZE, VECTOR_MAIN_WEIGHT, VECTOR_CONCEPT_WEIGHT  # noqa: E402
     _EMBEDDING_CLIENT = EmbeddingClient()
     _EMBED_AVAILABLE = True
 except ImportError:
     _EMBEDDING_CLIENT = None  # type: ignore[assignment]
     _EMBED_AVAILABLE = False
+    VECTOR_MAIN_WEIGHT    = float(os.getenv("VECTOR_MAIN_WEIGHT",    "1.0"))
+    VECTOR_CONCEPT_WEIGHT = float(os.getenv("VECTOR_CONCEPT_WEIGHT", "0.2"))
 
 # ---------------------------------------------------------------------------
 # Chunking constants
@@ -385,14 +390,26 @@ def _make_chunk_records(
     source_id = doc["id"]
     search_text = doc.get("search_text", "").strip()
 
+    # Parse the document-level concept list once.
+    # concepts is stored as a pipe-separated string ("a | b | c") or may
+    # already be a list in intermediate representations.
+    doc_concepts_raw = doc.get("concepts", "")
+    if isinstance(doc_concepts_raw, list):
+        doc_concept_list = doc_concepts_raw
+    else:
+        doc_concept_list = [c.strip() for c in doc_concepts_raw.split("|") if c.strip()]
+
     if not search_text:
-        # No text to chunk: emit one record with no chunk_vector
+        # No text to chunk: emit one record with no chunk_vector.
+        # For empty-text records, no meaningful scoping is possible — use empty
+        # concept text to avoid pulling in unrelated document-level concepts.
         chunk_rec = dict(doc)
         chunk_rec["doc_id"] = source_id
         chunk_rec["chunk_id"] = f"{source_id}__c0"
         chunk_rec["id"] = chunk_rec["chunk_id"]
         chunk_rec["chunk_index"] = 0
         chunk_rec["chunk_text"] = ""
+        chunk_rec["chunk_concept_text"] = ""
         chunk_rec["chunk_count"] = 1
         chunk_rec["chunk_char_start"] = 0
         chunk_rec["chunk_char_end"] = 0
@@ -407,6 +424,11 @@ def _make_chunk_records(
         chunk_rec["id"] = chunk_rec["chunk_id"]
         chunk_rec["chunk_index"] = idx
         chunk_rec["chunk_text"] = chunk_text
+        # Scope concept text to only the concepts that appear in this chunk.
+        # This prevents chunks from inheriting unrelated document-level concepts
+        # (e.g., a chunk mentioning "AI" should not carry concepts about "privacy"
+        # just because the parent document covers both topics).
+        chunk_rec["chunk_concept_text"] = _chunk_concept_text(chunk_text, doc_concept_list)
         chunk_rec["chunk_count"] = len(spans)
         chunk_rec["chunk_char_start"] = char_start
         chunk_rec["chunk_char_end"] = char_end
@@ -415,10 +437,71 @@ def _make_chunk_records(
     return records
 
 
-def _embed_chunk_records(docs: list[dict]) -> tuple[int, int, int]:
-    """Embed chunk_text for the provided chunk records.
+def _chunk_concept_text(chunk_text: str, doc_concept_list: list[str]) -> str:
+    """Return concept text scoped to the concepts that appear in *chunk_text*.
 
-    Returns (attempted, success, skipped).
+    Only concepts whose phrase appears (case-insensitively) within *chunk_text*
+    are included.  Preserves the original extractor order and deduplicates.
+    When no concepts match, returns an empty string.
+
+    This replaces the previous fallback where every chunk inherited the full
+    document concept list regardless of relevance.
+    """
+    if not doc_concept_list or not chunk_text:
+        return ""
+    chunk_lower = chunk_text.lower()
+    seen: set[str] = set()
+    matched: list[str] = []
+    for concept in doc_concept_list:
+        phrase = concept.strip()
+        if not phrase:
+            continue
+        key = phrase.lower()
+        if key not in seen and key in chunk_lower:
+            seen.add(key)
+            matched.append(phrase)
+    return build_concept_text(matched)
+
+
+def _combine_vectors(
+    main_vec: list[float],
+    concept_vec: list[float],
+    main_weight: float = VECTOR_MAIN_WEIGHT,
+    concept_weight: float = VECTOR_CONCEPT_WEIGHT,
+) -> list[float]:
+    """Weighted elementwise combination of two vectors, L2-normalised.
+
+    Implements the dual-path combination formula:
+        combined = normalize(main_weight * f(a+b) + concept_weight * f(b))
+
+    The default weights (main=1.0, concept=0.2) keep the full-text embedding
+    as the primary signal while giving the concept channel a secondary boost.
+    Equal weights (1.0, 1.0) reproduce the previous equal-weight behaviour.
+
+    If the concept vector is all zeros (no concepts) the result is just the
+    normalised scaled main vector.  Returns the zero vector if the weighted
+    sum is the zero vector (degenerate case).
+    """
+    dim = len(main_vec)
+    summed = [main_weight * main_vec[i] + concept_weight * concept_vec[i] for i in range(dim)]
+    norm = math.sqrt(sum(v * v for v in summed))
+    if norm == 0.0:
+        return summed
+    return [v / norm for v in summed]
+
+
+def _embed_chunk_records(docs: list[dict]) -> tuple[int, int, int]:
+    """Embed chunk_text and chunk_concept_text for the provided chunk records.
+
+    Generates three vector fields per chunk:
+      - chunk_main_vector    : embedding of chunk_text (f(a'+b'))
+      - chunk_concept_vector : embedding of chunk_concept_text (f(b')); zero vec if empty
+      - chunk_vector         : normalize(main_weight * chunk_main_vector + concept_weight * chunk_concept_vector)
+
+    chunk_vector is the combined retrieval field used in Solr kNN queries.
+
+    Returns (attempted, success, skipped) where success counts chunks that
+    received a valid chunk_vector.
     """
     if not _EMBED_AVAILABLE or _EMBEDDING_CLIENT is None:
         return 0, 0, 0
@@ -427,23 +510,70 @@ def _embed_chunk_records(docs: list[dict]) -> tuple[int, int, int]:
     if not indices:
         return 0, 0, 0
 
-    texts: list[str] = []
+    # Collect main texts (chunk_text) for batch embedding
+    main_texts: list[str] = []
     for i in indices:
         ct = docs[i]["chunk_text"]
         if len(ct) > EMBED_MAX_CHARS:
             ct = ct[:EMBED_MAX_CHARS]
-        texts.append(ct)
+        main_texts.append(ct)
 
-    embeddings = _EMBEDDING_CLIENT.embed_batch(texts, batch_size=EMBED_BATCH_SIZE)
+    main_embeddings = _EMBEDDING_CLIENT.embed_batch(main_texts, batch_size=EMBED_BATCH_SIZE)
+
+    # Collect concept texts; only embed non-empty ones to save calls
+    concept_indices: list[int] = []   # positions within `indices`
+    concept_texts: list[str] = []
+    for pos, i in enumerate(indices):
+        ct = docs[i].get("chunk_concept_text", "").strip()
+        if ct:
+            concept_indices.append(pos)
+            if len(ct) > EMBED_MAX_CHARS:
+                ct = ct[:EMBED_MAX_CHARS]
+            concept_texts.append(ct)
+
+    concept_embeddings_sparse: list[list[float] | None] = []
+    if concept_texts:
+        concept_embeddings_sparse = _EMBEDDING_CLIENT.embed_batch(
+            concept_texts, batch_size=EMBED_BATCH_SIZE
+        )
+
+    # Map position-within-indices → concept embedding (None if unavailable)
+    concept_emb_by_pos: dict[int, list[float] | None] = {}
+    for sparse_pos, pos in enumerate(concept_indices):
+        concept_emb_by_pos[pos] = (
+            concept_embeddings_sparse[sparse_pos]
+            if sparse_pos < len(concept_embeddings_sparse)
+            else None
+        )
+
     success = 0
     skipped = 0
-    for doc_idx, emb in zip(indices, embeddings):
-        if emb is not None:
-            docs[doc_idx]["chunk_vector"] = emb
-            success += 1
-        else:
+    dim = None  # inferred from first successful main embedding
+
+    for pos, (doc_idx, main_emb) in enumerate(zip(indices, main_embeddings)):
+        if main_emb is None:
             docs[doc_idx].pop("chunk_vector", None)
+            docs[doc_idx].pop("chunk_main_vector", None)
+            docs[doc_idx].pop("chunk_concept_vector", None)
             skipped += 1
+            continue
+
+        if dim is None:
+            dim = len(main_emb)
+
+        concept_emb = concept_emb_by_pos.get(pos)
+        if concept_emb is None:
+            # No concepts or embedding failed: use zero vector for concept channel
+            zero_vec: list[float] = [0.0] * (dim or len(main_emb))
+            concept_emb = zero_vec
+
+        combined = _combine_vectors(main_emb, concept_emb)
+
+        docs[doc_idx]["chunk_main_vector"] = main_emb
+        docs[doc_idx]["chunk_concept_vector"] = concept_emb
+        docs[doc_idx]["chunk_vector"] = combined
+        success += 1
+
     return len(indices), success, skipped
 
 
@@ -456,20 +586,31 @@ def _source_doc_from_chunks(chunks: list[dict]) -> dict:
         "chunk_id",
         "chunk_index",
         "chunk_text",
+        "chunk_concept_text",
         "chunk_count",
         "chunk_char_start",
         "chunk_char_end",
         "chunk_vector",
+        "chunk_main_vector",
+        "chunk_concept_vector",
     ):
         source.pop(key, None)
     return source
 
 
 def embed_docs(docs: list[dict]) -> None:
-    """Embed chunk_text for each chunk record in-place, writing into 'chunk_vector'.
+    """Embed chunk_text and chunk_concept_text for each chunk record in-place.
+
+    Writes three vector fields per successfully embedded chunk:
+      - chunk_main_vector    : f(a'+b') — main text embedding
+      - chunk_concept_vector : f(b')    — concept text embedding (zero vec if no concepts)
+      - chunk_vector         : normalize(main_weight * chunk_main_vector + concept_weight * chunk_concept_vector)
+
+    chunk_vector is the combined retrieval field used in Solr kNN queries.
 
     Chunk records that lack chunk_text are skipped.  On embedding failure the
-    field is not written — those chunks are still indexed for BM25 retrieval.
+    vector fields are not written — those chunks are still indexed for BM25
+    retrieval.
 
     Retry logic:
       - If a chunk text exceeds EMBED_MAX_CHARS, truncate it before retrying.
@@ -490,7 +631,7 @@ def embed_docs(docs: list[dict]) -> None:
     if not embeddable:
         return
 
-    print(f"[INFO] Embedding {len(embeddable)} chunks (batch_size={EMBED_BATCH_SIZE}) …")
+    print(f"[INFO] Embedding {len(embeddable)} chunks (dual-path, batch_size={EMBED_BATCH_SIZE}) …")
     attempted, _success, skipped = _embed_chunk_records(docs)
 
     fallback_docs = 0

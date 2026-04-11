@@ -312,6 +312,9 @@ def index() -> str:
                 bq_parts.append(fuzzy_bq)
 
         # ---- Hybrid retrieval pipeline ----
+        # Build concept_text for dual-path vector embedding (channel b = f(b)).
+        concept_text = nlp_info.get("concept_text", "") if use_nlp and nlp_info else ""
+
         start = time.perf_counter()
         try:
             results, facets, num_found, info = _hybrid.search(
@@ -324,6 +327,7 @@ def index() -> str:
                 use_nlp=use_nlp,
                 query_text=q,  # use original query for semantic embedding
                 use_vector=use_vector,
+                concept_text=concept_text,
             )
             elapsed = (time.perf_counter() - start) * 1000
             response_ms = round(elapsed, 2)

@@ -21,9 +21,12 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Domain vocabulary (kept in sync with nlp_utils.PROTECTED_QUERY_TERMS)
@@ -210,6 +213,21 @@ def _extract_features(query: str) -> dict[str, Any]:
     )
     keyword_ratio = keyword_token_count / max(token_count, 1)
 
+    # POS-derived verb features (spaCy, defensive)
+    has_verb = False
+    verb_count = 0
+    verb_lemmas: list[str] = []
+    pos_available = False
+    try:
+        from nlp_utils import extract_query_pos_features
+        pos_feats = extract_query_pos_features(query)
+        has_verb = pos_feats["has_verb"]
+        verb_count = pos_feats["verb_count"]
+        verb_lemmas = pos_feats["verb_lemmas"]
+        pos_available = pos_feats["pos_available"]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("POS tagging unavailable for query intent; falling back: %s", exc)
+
     return {
         "char_len": char_len,
         "token_count": token_count,
@@ -222,6 +240,11 @@ def _extract_features(query: str) -> dict[str, Any]:
         "looks_like_sentence": looks_like_sentence,
         "keyword_ratio": keyword_ratio,
         "first_token": first_token,
+        # POS-derived verb features
+        "has_verb": has_verb,
+        "verb_count": verb_count,
+        "verb_lemmas": verb_lemmas,
+        "pos_available": pos_available,
     }
 
 
@@ -278,6 +301,12 @@ def _score_signals(features: dict[str, Any]) -> tuple[dict[str, float], float]:
         signals["short_entity"] = -1.0
     elif features["token_count"] <= 3 and features["entity_count"] >= 1 and not features["question_word_any"]:
         signals["short_entity_no_question"] = -0.7
+
+    # POS-derived verb signal: lexical verb/aux detected in the query
+    if features.get("pos_available") and features.get("has_verb"):
+        signals["verb_present"] = 1.2
+        if features.get("verb_count", 0) >= 2:
+            signals["multiple_verbs"] = 0.4
 
     total = sum(signals.values())
     return signals, total

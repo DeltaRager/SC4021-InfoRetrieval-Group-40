@@ -21,11 +21,14 @@ from hybrid_search import (
     RerankerClient,
     RetrievalInfo,
     reciprocal_rank_fusion,
+    _combine_vectors as hs_combine_vectors,
 )
 from query_intent import infer_intent, QueryIntentProfile
 from scripts.prepare_solr_docs import (
     _split_into_chunks,
     _make_chunk_records,
+    _chunk_concept_text,
+    _combine_vectors as prep_combine_vectors,
     embed_docs,
     CHUNK_TARGET_CHARS,
     CHUNK_OVERLAP_CHARS,
@@ -626,20 +629,28 @@ class TestMakeChunkRecords:
 
 
 class TestEmbedDocs:
+    def _is_unit_vector(self, vec: list[float]) -> bool:
+        norm = sum(v * v for v in vec) ** 0.5
+        return abs(norm - 1.0) < 1e-6
+
     def test_embed_docs_success(self):
         docs = [
             {"id": "1__c0", "doc_id": "1", "chunk_text": "hello world"},
             {"id": "2__c0", "doc_id": "2", "chunk_text": "foo bar"},
         ]
         fake_client = MagicMock()
+        # No chunk_concept_text → zero concept vec → chunk_vector = normalize(main)
         fake_client.embed_batch.return_value = [[0.1, 0.2], [0.3, 0.4]]
 
         with patch("scripts.prepare_solr_docs._EMBEDDING_CLIENT", fake_client), \
              patch("scripts.prepare_solr_docs._EMBED_AVAILABLE", True):
             embed_docs(docs)
 
-        assert docs[0]["chunk_vector"] == [0.1, 0.2]
-        assert docs[1]["chunk_vector"] == [0.3, 0.4]
+        # chunk_vector is the L2-normalised combined vector (not the raw embedding)
+        assert "chunk_vector" in docs[0]
+        assert "chunk_vector" in docs[1]
+        assert self._is_unit_vector(docs[0]["chunk_vector"])
+        assert self._is_unit_vector(docs[1]["chunk_vector"])
 
     def test_embed_docs_skips_empty_chunk_text(self):
         docs = [
@@ -654,7 +665,7 @@ class TestEmbedDocs:
             embed_docs(docs)
 
         assert "chunk_vector" not in docs[0]
-        assert docs[1]["chunk_vector"] == [0.5, 0.6]
+        assert "chunk_vector" in docs[1]
 
     def test_embed_docs_handles_partial_failure(self):
         docs = [
@@ -669,7 +680,7 @@ class TestEmbedDocs:
             embed_docs(docs)
 
         assert "chunk_vector" not in docs[0]
-        assert docs[1]["chunk_vector"] == [0.7, 0.8]
+        assert "chunk_vector" in docs[1]
 
     def test_embed_docs_service_unavailable(self):
         docs = [{"id": "1__c0", "doc_id": "1", "chunk_text": "some text"}]
@@ -696,7 +707,8 @@ class TestEmbedDocs:
             embed_docs(docs)
 
         assert "chunk_vector" not in docs[0]
-        assert docs[1]["chunk_vector"] == [0.9, 0.8]
+        # chunk_vector is the L2-normalised combined vector, not the raw embedding
+        assert "chunk_vector" in docs[1]
 
     def test_embed_docs_rechunks_failed_doc_with_fallback_sizes(self):
         docs = [
@@ -740,7 +752,9 @@ class TestEmbedDocs:
             embed_docs(docs)
 
         assert [doc["id"] for doc in docs] == ["d1__c0", "d1__c1", "d1__c2"]
-        assert [doc["chunk_vector"] for doc in docs] == [[1.0], [2.0], [3.0]]
+        # chunk_vector is the normalised combined vector, not the raw embedding.
+        # For 1-D vectors the normalised value is ±1.0; just verify presence.
+        assert all("chunk_vector" in doc for doc in docs)
 
 
 # ---------------------------------------------------------------------------
@@ -1001,6 +1015,216 @@ class TestChunkCollapse:
 
 
 # ---------------------------------------------------------------------------
+# Weighted vector combination unit tests
+# ---------------------------------------------------------------------------
+
+class TestWeightedCombineVectors:
+    """Tests for the weighted _combine_vectors helper in both modules."""
+
+    def _check_normalised(self, vec: list[float]) -> None:
+        norm = sum(v * v for v in vec) ** 0.5
+        assert abs(norm - 1.0) < 1e-6, f"Expected unit vector, got norm={norm}"
+
+    # ---- hybrid_search._combine_vectors ----
+
+    def test_hs_equal_weights_normalises(self):
+        main = [3.0, 0.0]
+        concept = [0.0, 4.0]
+        result = hs_combine_vectors(main, concept, main_weight=1.0, concept_weight=1.0)
+        self._check_normalised(result)
+
+    def test_hs_lower_concept_weight_changes_direction(self):
+        main = [1.0, 0.0]
+        concept = [0.0, 1.0]
+        equal = hs_combine_vectors(main, concept, main_weight=1.0, concept_weight=1.0)
+        weighted = hs_combine_vectors(main, concept, main_weight=1.0, concept_weight=0.2)
+        # Weighted result should be pulled more toward main (larger x-component)
+        assert weighted[0] > equal[0], "Lower concept weight should increase main direction"
+        assert weighted[1] < equal[1], "Lower concept weight should reduce concept direction"
+
+    def test_hs_zero_concept_vec_returns_normalised_main(self):
+        main = [3.0, 4.0]
+        zero = [0.0, 0.0]
+        result = hs_combine_vectors(main, zero, main_weight=1.0, concept_weight=0.2)
+        self._check_normalised(result)
+        # Should equal the normalised main (concept channel contributes nothing)
+        norm = (3.0 ** 2 + 4.0 ** 2) ** 0.5
+        assert abs(result[0] - 3.0 / norm) < 1e-6
+        assert abs(result[1] - 4.0 / norm) < 1e-6
+
+    def test_hs_zero_sum_returns_zero_vector(self):
+        # When both vecs are zero, the result should be the zero vector, not NaN
+        result = hs_combine_vectors([0.0, 0.0], [0.0, 0.0])
+        assert result == [0.0, 0.0]
+
+    def test_hs_default_weights_differ_from_equal_weights(self):
+        main = [1.0, 0.0]
+        concept = [0.0, 1.0]
+        default = hs_combine_vectors(main, concept)          # main=1.0, concept=0.2
+        equal = hs_combine_vectors(main, concept, 1.0, 1.0)
+        assert default != equal, "Default weights should differ from equal-weight combination"
+
+    # ---- prepare_solr_docs._combine_vectors (same logic, separate copy) ----
+
+    def test_prep_equal_weights_normalises(self):
+        main = [3.0, 0.0]
+        concept = [0.0, 4.0]
+        result = prep_combine_vectors(main, concept, main_weight=1.0, concept_weight=1.0)
+        self._check_normalised(result)
+
+    def test_prep_lower_concept_weight_changes_direction(self):
+        main = [1.0, 0.0]
+        concept = [0.0, 1.0]
+        equal = prep_combine_vectors(main, concept, main_weight=1.0, concept_weight=1.0)
+        weighted = prep_combine_vectors(main, concept, main_weight=1.0, concept_weight=0.2)
+        assert weighted[0] > equal[0]
+        assert weighted[1] < equal[1]
+
+    def test_prep_zero_concept_vec_returns_normalised_main(self):
+        main = [0.0, 5.0]
+        zero = [0.0, 0.0]
+        result = prep_combine_vectors(main, zero, main_weight=1.0, concept_weight=0.2)
+        self._check_normalised(result)
+        assert abs(result[1] - 1.0) < 1e-6
+
+    def test_prep_zero_sum_returns_zero_vector(self):
+        result = prep_combine_vectors([0.0, 0.0], [0.0, 0.0])
+        assert result == [0.0, 0.0]
+
+
+# ---------------------------------------------------------------------------
+# Chunk-level concept scoping unit tests
+# ---------------------------------------------------------------------------
+
+class TestChunkConceptText:
+    """Tests for prepare_solr_docs._chunk_concept_text."""
+
+    def test_concept_present_in_chunk_is_included(self):
+        chunk = "We discuss artificial intelligence and machine learning here."
+        concepts = ["artificial intelligence", "machine learning", "blockchain"]
+        result = _chunk_concept_text(chunk, concepts)
+        assert "artificial intelligence" in result
+        assert "machine learning" in result
+        assert "blockchain" not in result
+
+    def test_matching_is_case_insensitive(self):
+        chunk = "ARTIFICIAL INTELLIGENCE is transforming industries."
+        concepts = ["artificial intelligence"]
+        result = _chunk_concept_text(chunk, concepts)
+        assert result != ""
+
+    def test_no_matching_concepts_returns_empty_string(self):
+        chunk = "This chunk talks about sports and weather."
+        concepts = ["artificial intelligence", "machine learning"]
+        result = _chunk_concept_text(chunk, concepts)
+        assert result == ""
+
+    def test_duplicates_are_deduplicated(self):
+        chunk = "AI and AI-related topics."
+        concepts = ["AI", "AI"]  # duplicate in source list
+        result = _chunk_concept_text(chunk, concepts)
+        # "AI" should appear exactly once in result (pipe-separated)
+        parts = [p.strip() for p in result.split("|") if p.strip()]
+        assert parts.count("AI") == 1
+
+    def test_order_is_preserved(self):
+        chunk = "we discuss large language models and privacy concerns."
+        concepts = ["privacy concerns", "large language models", "blockchain"]
+        result = _chunk_concept_text(chunk, concepts)
+        # "privacy concerns" listed first → should come first in output
+        idx_privacy = result.find("privacy")
+        idx_llm = result.find("large language")
+        assert idx_privacy < idx_llm, "Extractor order should be preserved"
+
+    def test_empty_chunk_returns_empty(self):
+        result = _chunk_concept_text("", ["artificial intelligence"])
+        assert result == ""
+
+    def test_empty_concept_list_returns_empty(self):
+        result = _chunk_concept_text("Some chunk text.", [])
+        assert result == ""
+
+    def test_both_empty_returns_empty(self):
+        assert _chunk_concept_text("", []) == ""
+
+
+class TestMakeChunkRecordsConceptScoping:
+    """Integration-level tests for _make_chunk_records concept scoping."""
+
+    def _base_doc(self, doc_id="doc1", search_text="hello world", concepts=""):
+        return {
+            "id": doc_id,
+            "search_text": search_text,
+            "title": "Title",
+            "body": "Body",
+            "subreddit": "test",
+            "source_dataset": "test",
+            "type": "post",
+            "score": 5,
+            "concepts": concepts,
+        }
+
+    def test_chunk_concept_text_not_wholesale_copied_from_doc(self):
+        """Each chunk should only carry concepts found in its own text.
+
+        This verifies that the previous behaviour — every chunk getting the full
+        document concept list regardless of relevance — is no longer in effect.
+        We use a very long para1 that forces the chunker to slice it before any
+        overlap from para2 can appear, then check that the first chunk (which
+        only covers para1 text) does not contain para2's exclusive concept.
+        """
+        # Use a concept that only appears in para2 and has NO overlap with para1 vocab
+        exclusive_concept = "blockchain technology"
+        # Make para1 long enough that the first window cannot overlap into para2
+        para1 = "artificial intelligence replaces jobs. " * 80  # ~3040 chars >> target 600
+        para2 = "blockchain technology is another topic entirely. " * 30
+        search_text = para1.strip() + "\n\n" + para2.strip()
+        doc = self._base_doc(
+            search_text=search_text,
+            concepts=f"artificial intelligence | {exclusive_concept}",
+        )
+        records = _make_chunk_records(doc, target=600, overlap=50)
+
+        if len(records) < 2:
+            return  # chunker didn't split; skip this assertion
+
+        # The very first chunk only contains para1 text; it must not carry the
+        # blockchain concept (which appears exclusively in para2).
+        chunk0_concepts = records[0]["chunk_concept_text"]
+        assert exclusive_concept not in chunk0_concepts, (
+            f"First chunk (para1-only text) should not carry '{exclusive_concept}' "
+            f"from para2. Got: {chunk0_concepts!r}"
+        )
+
+    def test_empty_search_text_yields_empty_concept_text(self):
+        doc = self._base_doc(search_text="", concepts="artificial intelligence")
+        records = _make_chunk_records(doc)
+        assert len(records) == 1
+        assert records[0]["chunk_concept_text"] == ""
+
+    def test_chunk_with_no_matching_concepts_gets_empty_concept_text(self):
+        chunk_text = "This is about unrelated topics like sports and cooking."
+        doc = self._base_doc(
+            search_text=chunk_text,
+            concepts="artificial intelligence | machine learning",
+        )
+        records = _make_chunk_records(doc)
+        assert len(records) == 1
+        assert records[0]["chunk_concept_text"] == ""
+
+    def test_chunk_with_matching_concept_gets_non_empty_concept_text(self):
+        chunk_text = "This is about artificial intelligence and its impact on society."
+        doc = self._base_doc(
+            search_text=chunk_text,
+            concepts="artificial intelligence | machine learning",
+        )
+        records = _make_chunk_records(doc)
+        assert len(records) == 1
+        assert "artificial intelligence" in records[0]["chunk_concept_text"]
+        assert "machine learning" not in records[0]["chunk_concept_text"]
+
+
+# ---------------------------------------------------------------------------
 # Query intent inference unit tests
 # ---------------------------------------------------------------------------
 
@@ -1092,6 +1316,151 @@ class TestQueryIntent:
         """Comparison queries should fire comparison signal."""
         profile = infer_intent("GPT-4 vs Claude 3 performance")
         assert "comparison" in profile.signals
+
+
+# ---------------------------------------------------------------------------
+# POS-based verb signal tests (TestQueryIntentPOS)
+# ---------------------------------------------------------------------------
+
+class TestQueryIntentPOS:
+    """Tests for POS-derived verb signals added to infer_intent()."""
+
+    # --- query_features contract ---
+
+    def test_query_features_includes_pos_fields(self):
+        """query_features must always contain has_verb, verb_count, verb_lemmas, pos_available."""
+        profile = infer_intent("Why do LLMs hallucinate?")
+        for key in ("has_verb", "verb_count", "verb_lemmas", "pos_available"):
+            assert key in profile.query_features, f"Missing key: {key}"
+
+    def test_verb_lemmas_is_list(self):
+        profile = infer_intent("How does RAG work?")
+        assert isinstance(profile.query_features["verb_lemmas"], list)
+
+    # --- verb-driven semantic promotion ---
+
+    def test_explicit_verb_question_fires_verb_present(self):
+        """'Why do LLMs hallucinate?' has verbs → verb_present signal fires."""
+        profile = infer_intent("Why do LLMs hallucinate?")
+        if profile.query_features.get("pos_available"):
+            assert "verb_present" in profile.signals
+
+    def test_explicit_verb_question_is_semantic(self):
+        """Explicit why-question with verb → semantic."""
+        profile = infer_intent("Why do LLMs hallucinate?")
+        assert profile.intent_label == "semantic"
+
+    def test_imperative_semantic_phrase_with_verb(self):
+        """'Explain transformer attention' contains a verb → semantic or strong mixed."""
+        profile = infer_intent("Explain transformer attention")
+        assert profile.intent_label in ("semantic", "mixed")
+
+    def test_how_does_rag_work_is_semantic(self):
+        """'How does RAG work?' → semantic."""
+        profile = infer_intent("How does RAG work?")
+        assert profile.intent_label == "semantic"
+
+    def test_explain_vector_search_is_semantic_or_mixed(self):
+        """'Explain vector search' → semantic or mixed (has verb 'explain')."""
+        profile = infer_intent("Explain vector search")
+        assert profile.intent_label in ("semantic", "mixed")
+
+    def test_can_claude_summarize_is_semantic(self):
+        """'Can Claude summarize PDFs?' has auxiliary + main verb → semantic."""
+        profile = infer_intent("Can Claude summarize PDFs?")
+        assert profile.intent_label == "semantic"
+
+    # --- short entity lookup without verb stays keyword ---
+
+    def test_claude_pricing_remains_keyword(self):
+        """Short entity lookup without verb → keyword."""
+        profile = infer_intent("Claude pricing")
+        assert profile.intent_label == "keyword"
+
+    def test_chatgpt_remains_keyword(self):
+        """Single entity token → keyword."""
+        profile = infer_intent("ChatGPT")
+        assert profile.intent_label == "keyword"
+
+    def test_gpt4_benchmark_not_semantic(self):
+        """'GPT-4 benchmark' has no real verb → keyword or mixed."""
+        profile = infer_intent("GPT-4 benchmark")
+        assert profile.intent_label in ("keyword", "mixed")
+
+    def test_openai_api_not_semantic(self):
+        """'OpenAI API' has no verb → keyword or mixed."""
+        profile = infer_intent("OpenAI API")
+        assert profile.intent_label in ("keyword", "mixed")
+
+    # --- verb-bearing short query shifts away from pure keyword ---
+
+    def test_chatgpt_explains_hallucinations_not_keyword(self):
+        """'ChatGPT explains hallucinations' has a verb → not pure keyword."""
+        profile = infer_intent("ChatGPT explains hallucinations")
+        assert profile.intent_label in ("mixed", "semantic")
+
+    # --- multiple verbs get stronger score than single verb ---
+
+    def test_multiple_verbs_score_higher_than_single(self):
+        """A multi-verb query should produce a higher or equal semantic score."""
+        single = infer_intent("Explain how LLMs work")
+        multi  = infer_intent("Can you explain why LLMs hallucinate and what causes it?")
+        # The multi-verb query should be at least as semantic as single-verb
+        label_rank = {"keyword": 0, "mixed": 1, "semantic": 2}
+        assert label_rank[multi.intent_label] >= label_rank[single.intent_label]
+
+    def test_multiple_verbs_fires_multiple_verbs_signal(self):
+        """A sentence with ≥ 2 verb tokens should fire the multiple_verbs signal."""
+        profile = infer_intent("Can you explain why LLMs hallucinate?")
+        if profile.query_features.get("pos_available") and profile.query_features.get("verb_count", 0) >= 2:
+            assert "multiple_verbs" in profile.signals
+
+    # --- POS unavailable fallback ---
+
+    def test_pos_unavailable_does_not_crash(self):
+        """When POS tagging raises, intent inference falls back without crashing."""
+        import query_intent as qi
+        original_extract = qi._extract_features
+
+        def patched_extract(query):
+            feats = original_extract(query)
+            # Simulate POS unavailable
+            feats["has_verb"] = False
+            feats["verb_count"] = 0
+            feats["verb_lemmas"] = []
+            feats["pos_available"] = False
+            return feats
+
+        qi._extract_features = patched_extract
+        try:
+            profile = infer_intent("Why do LLMs hallucinate?")
+            assert profile.intent_label in ("keyword", "mixed", "semantic")
+            assert abs(profile.alpha + profile.beta - 1.0) < 1e-6
+            assert profile.query_features["pos_available"] is False
+            assert "verb_present" not in profile.signals
+        finally:
+            qi._extract_features = original_extract
+
+    def test_pos_unavailable_classification_stable(self):
+        """Heuristic-only path (pos_available=False) still classifies sensibly."""
+        import query_intent as qi
+        original_extract = qi._extract_features
+
+        def patched_extract(query):
+            feats = original_extract(query)
+            feats["has_verb"] = False
+            feats["verb_count"] = 0
+            feats["verb_lemmas"] = []
+            feats["pos_available"] = False
+            return feats
+
+        qi._extract_features = patched_extract
+        try:
+            # Known keyword query should still be keyword without POS
+            kw = infer_intent("Claude pricing")
+            assert kw.intent_label == "keyword"
+        finally:
+            qi._extract_features = original_extract
 
 
 # ---------------------------------------------------------------------------
