@@ -125,9 +125,14 @@
         <option value="subjective" {% if subjectivity == 'subjective' %}selected{% endif %}>Subjective</option>
         <option value="objective"  {% if subjectivity == 'objective'  %}selected{% endif %}>Objective</option>
       </select>
+      <select name="sarcasm">
+        <option value="">Any sarcasm</option>
+        <option value="sarcastic"     {% if sarcasm == 'sarcastic'     %}selected{% endif %}>Sarcastic</option>
+        <option value="non_sarcastic" {% if sarcasm == 'non_sarcastic' %}selected{% endif %}>Non-sarcastic</option>
+      </select>
       <select name="source_dataset">
         <option value="">All datasets</option>
-        <option value="mega_ai_posts_comments_classified" {% if source_dataset == 'mega_ai_posts_comments_classified' %}selected{% endif %}>Classified</option>
+        <option value="final_reddit_dataset_with_predictions" {% if source_dataset == 'final_reddit_dataset_with_predictions' %}selected{% endif %}>Reddit Predictions</option>
       </select>
       <select name="model">
         <option value="">Any model</option>
@@ -676,6 +681,9 @@
             {% endif %}
             {% if r.subjectivity_label and r.subjectivity_label != 'unknown' %}
               <span class="badge badge-{{ r.subjectivity_label }}">{{ r.subjectivity_label }}</span>
+            {% endif %}
+            {% if r.sarcasm_label and r.sarcasm_label != 'unknown' %}
+              <span class="badge badge-{{ r.sarcasm_label }}">{{ r.sarcasm_label | replace('_', ' ') }}</span>
             {% endif %}
             {% if r.score is defined %}<span>score {{ r.score }}</span>{% endif %}
             {% if r.created_date %}<span>{{ r.created_date[:10] }}</span>{% endif %}

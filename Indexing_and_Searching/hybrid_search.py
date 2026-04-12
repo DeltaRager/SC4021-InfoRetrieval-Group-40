@@ -407,8 +407,7 @@ def reciprocal_rank_fusion(
 
 DISPLAY_FIELDS = (
     "id,doc_id,type,title,body,subreddit,score,created_date,"
-    "source_dataset,polarity_label,polarity_confidence,"
-    "subjectivity_label,subjectivity_confidence,"
+    "source_dataset,polarity_label,subjectivity_label,sarcasm_label,"
     "model_mentions,vendor_mentions,search_text,chunk_text,concepts"
 )
 
@@ -420,6 +419,7 @@ FACET_FIELDS = (
     "subreddit",
     "polarity_label",
     "subjectivity_label",
+    "sarcasm_label",
     "source_dataset",
     "model_mentions",
     "vendor_mentions",
@@ -429,7 +429,7 @@ FACET_FIELDS = (
 def _facets_from_results(results: list[dict]) -> dict[str, list]:
     """Compute facet counts from the final result set.
 
-    Single-value fields (type, subreddit, polarity_label, subjectivity_label, source_dataset)
+    Single-value fields (type, subreddit, polarity_label, subjectivity_label, sarcasm_label, source_dataset)
     and multi-value fields (model_mentions, vendor_mentions) are both handled.
     Returns a dict of {field: [val, count, val, count, ...]} matching the
     flat-pairs format expected by the template's facet_links macro.

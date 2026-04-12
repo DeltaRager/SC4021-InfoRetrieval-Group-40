@@ -2,14 +2,14 @@
 Single-source ingestion pipeline for the AI Opinion Search Engine.
 
 Layers:
-  Loader     -> CSV parsing for mega_ai_posts_comments_classified.csv
+  Loader     -> CSV parsing for final_reddit_dataset_with_predictions.csv
   Normalizer -> canonical SolrDoc creation
   Enrichment -> model/vendor mention extraction + NLP (lemmatization/concepts)
   Chunker    -> splits long search_text into overlapping chunks for vector indexing
   Serializer -> JSONL output (one record per chunk, carrying full source-doc metadata)
 
 Source:
-  - mega_ai_posts_comments_classified.csv  (classified schema)
+  - final_reddit_dataset_with_predictions.csv  (Reddit predictions schema)
 
 Output format:
   Each output record is a chunk record with chunk_id as the Solr `id`.
@@ -88,11 +88,9 @@ class SolrDoc:
     model_mentions: list[str]
     vendor_mentions: list[str]
     polarity_label: str             # positive | negative | neutral | unknown
-    polarity_confidence: float      # [0.0, 1.0]
-    polarity_latency_ms: float
     subjectivity_label: str         # subjective | objective | unknown
-    subjectivity_confidence: float  # [0.0, 1.0]
-    subjectivity_latency_ms: float
+    sarcasm_label: str              # sarcastic | non_sarcastic | unknown
+    sarcasm_code: int               # raw numeric code from source (1/0/-1); -1 = unknown
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -631,54 +629,86 @@ def embed_docs(docs: list[dict]) -> None:
 # Source-specific loaders
 # ---------------------------------------------------------------------------
 
-CLASSIFIED_FILE = "mega_ai_posts_comments_classified.csv"
+PREDICTIONS_FILE = "final_reddit_dataset_with_predictions.csv"
+
+# Numeric → label mappings for prediction columns
+_POLARITY_MAP = {1: "positive", 0: "negative", -1: "neutral"}
+_SUBJECTIVITY_MAP = {1: "subjective", 0: "objective"}
+_SARCASM_MAP = {1: "sarcastic", 0: "non_sarcastic"}
 
 
-def _safe_float(value, default: float = 0.0) -> float:
-    """Convert a value to float, returning *default* on failure."""
+def _map_prediction(raw, label_map: dict) -> str:
+    """Map a numeric prediction code to its string label, or 'unknown'."""
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return "unknown"
     try:
-        return float(value)
+        code = int(float(raw))
+        return label_map.get(code, "unknown")
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _safe_int_code(raw, default: int = -1) -> int:
+    """Return the integer prediction code, or *default* on failure."""
+    if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+        return default
+    try:
+        return int(float(raw))
     except (TypeError, ValueError):
         return default
 
 
-def load_classified_csv(csv_path: Path) -> list[SolrDoc]:
-    """Loader for mega_ai_posts_comments_classified.csv."""
+def load_reddit_predictions_csv(csv_path: Path) -> list[SolrDoc]:
+    """Loader for final_reddit_dataset_with_predictions.csv."""
     df = pd.read_csv(csv_path, encoding="utf-8-sig")
     docs: list[SolrDoc] = []
 
     for row in df.to_dict(orient="records"):
-        raw_text = clean_text(row.get("Post/Comment text", ""))
+        # --- Core text ---
+        raw_text = clean_text(row.get("text", ""))
         if not raw_text:
             continue
 
-        posted_time_raw = row.get("Posted time", "")
-        solr_date = to_solr_date(posted_time_raw)
-        score_raw = row.get("Number of upvotes", 0)
-        score = int(score_raw) if score_raw and not (isinstance(score_raw, float) and math.isnan(score_raw)) else 0
-        subreddit = clean_text(row.get("Subreddit the post/comment is from", "")).lstrip("r/")
-        subreddit = subreddit or "unknown"
+        source_id = str(row.get("id", "")).strip()
+        doc_type = str(row.get("type", "") or "").strip().lower() or "unknown"
+        title = clean_text(row.get("title", ""))
+        subreddit = clean_text(row.get("subreddit", "")).lstrip("r/") or "unknown"
+        url = str(row.get("url", "") or "").strip()
+        author = str(row.get("author", "") or "").strip()
 
+        # --- Timestamp: prefer created_dt, fall back to created_utc ---
+        solr_date = to_solr_date(row.get("created_dt") or row.get("created_utc"))
+
+        # --- Score ---
+        score_raw = row.get("score", 0)
+        score = int(score_raw) if score_raw and not (isinstance(score_raw, float) and math.isnan(score_raw)) else 0
+
+        # --- Body / search_text ---
         body = raw_text
-        search_text = body
+        # For posts include title in search_text; for comments body is enough
+        if doc_type == "post" and title:
+            search_text = f"{title} {body}"
+        else:
+            search_text = body
+
         lemmatized_text, concepts = enrich_nlp(search_text)
 
-        # Classified labels — normalise to lowercase; fall back to "unknown"
-        polarity_label = str(row.get("polarity_label", "") or "").strip().lower() or "unknown"
-        polarity_confidence = _safe_float(row.get("polarity_confidence", 0.0))
-        polarity_latency_ms = _safe_float(row.get("polarity_latency_ms", 0.0))
+        # --- Prediction labels (numeric → string) ---
+        polarity_label = _map_prediction(row.get("polarity"), _POLARITY_MAP)
+        subjectivity_label = _map_prediction(row.get("subjectivity"), _SUBJECTIVITY_MAP)
+        sarcasm_label = _map_prediction(row.get("sarcasm"), _SARCASM_MAP)
+        sarcasm_code = _safe_int_code(row.get("sarcasm"))
 
-        subjectivity_label = str(row.get("subjectivity_label", "") or "").strip().lower() or "unknown"
-        subjectivity_confidence = _safe_float(row.get("subjectivity_confidence", 0.0))
-        subjectivity_latency_ms = _safe_float(row.get("subjectivity_latency_ms", 0.0))
+        # Stable Solr id: use Reddit native id if available, else hash
+        stable_id = source_id if source_id else hash_id([PREDICTIONS_FILE, raw_text[:120], str(solr_date), subreddit])
 
         docs.append(SolrDoc(
-            id=hash_id([CLASSIFIED_FILE, raw_text[:120], str(posted_time_raw), subreddit]),
-            source_id="",
-            source_dataset="mega_ai_posts_comments_classified",
-            source_schema="classified_csv",
-            type="unknown",
-            title="",
+            id=stable_id,
+            source_id=source_id,
+            source_dataset="final_reddit_dataset_with_predictions",
+            source_schema="reddit_predictions_csv",
+            type=doc_type,
+            title=title,
             body=body,
             search_text=search_text,
             lemmatized_text=lemmatized_text,
@@ -688,15 +718,13 @@ def load_classified_csv(csv_path: Path) -> list[SolrDoc]:
             upvote_log=round(math.log1p(max(score, 0)), 4),
             created_date=solr_date or "",
             time_bucket=time_bucket(solr_date),
-            url="",
+            url=url,
             model_mentions=extract_models(body),
             vendor_mentions=extract_vendors(body),
             polarity_label=polarity_label,
-            polarity_confidence=round(polarity_confidence, 4),
-            polarity_latency_ms=round(polarity_latency_ms, 4),
             subjectivity_label=subjectivity_label,
-            subjectivity_confidence=round(subjectivity_confidence, 4),
-            subjectivity_latency_ms=round(subjectivity_latency_ms, 4),
+            sarcasm_label=sarcasm_label,
+            sarcasm_code=sarcasm_code,
         ))
 
     return docs
@@ -707,23 +735,24 @@ def load_classified_csv(csv_path: Path) -> list[SolrDoc]:
 # ---------------------------------------------------------------------------
 
 def prepare_docs(
-    classified_csv_path: Path,
+    predictions_csv_path: Path,
     output_path: Path,
 ) -> tuple[int, int, int]:
-    """Build chunk records from the classified CSV and write them to *output_path*.
+    """Build chunk records from the predictions CSV and write them to *output_path*.
 
     Returns (source_docs_processed, total_chunks, source_docs_with_zero_vectors).
     """
-    if not classified_csv_path.exists():
-        print(f"[ERROR] Classified CSV not found: {classified_csv_path}")
+    if not predictions_csv_path.exists():
+        print(f"[ERROR] Predictions CSV not found: {predictions_csv_path}")
         return 0, 0, 0
 
     source_docs: list[dict] = []
     seen: set[tuple] = set()
 
-    docs = load_classified_csv(classified_csv_path)
+    docs = load_reddit_predictions_csv(predictions_csv_path)
     for doc in docs:
-        sig = (doc.body.lower()[:200], doc.subreddit, doc.created_date)
+        # Deduplicate on stable id (Reddit native id already unique; hash fallback may collide)
+        sig = (doc.id,)
         if sig in seen:
             continue
         seen.add(sig)
@@ -766,7 +795,7 @@ def main() -> None:
     parser.add_argument(
         "--input",
         default=None,
-        help=f"Path to {CLASSIFIED_FILE} (auto-detected if omitted)",
+        help=f"Path to {PREDICTIONS_FILE} (auto-detected if omitted)",
     )
     args = parser.parse_args()
 
@@ -774,26 +803,26 @@ def main() -> None:
     index_root = Path(__file__).resolve().parents[1]
     output_path = index_root / args.output
 
-    # Resolve classified CSV: flag > sibling of index_root
+    # Resolve predictions CSV: flag > sibling of index_root
     if args.input:
-        classified_csv_path = Path(args.input).resolve()
+        predictions_csv_path = Path(args.input).resolve()
     else:
         candidates = [
-            index_root / CLASSIFIED_FILE,
-            index_root.parent / CLASSIFIED_FILE,
+            index_root / PREDICTIONS_FILE,
+            index_root.parent / PREDICTIONS_FILE,
         ]
-        classified_csv_path = next((p for p in candidates if p.exists()), None)
-        if classified_csv_path:
-            print(f"[INFO] Auto-detected classified CSV: {classified_csv_path}")
+        predictions_csv_path = next((p for p in candidates if p.exists()), None)
+        if predictions_csv_path:
+            print(f"[INFO] Auto-detected predictions CSV: {predictions_csv_path}")
         else:
-            print(f"[ERROR] {CLASSIFIED_FILE} not found. "
+            print(f"[ERROR] {PREDICTIONS_FILE} not found. "
                   "Use --input <path> to specify it.")
             return
 
     if not _NLP_AVAILABLE:
         print("[WARN] nlp_utils not available; lemmatized_text and concepts will be empty.")
 
-    source_count, chunk_count, zero_vec = prepare_docs(classified_csv_path, output_path)
+    source_count, chunk_count, zero_vec = prepare_docs(predictions_csv_path, output_path)
     print(
         f"Indexed {source_count} source docs → {chunk_count} chunk records. "
         f"Saved to {output_path}"

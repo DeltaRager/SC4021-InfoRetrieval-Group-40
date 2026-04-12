@@ -37,27 +37,27 @@ REQUIRED_SOLR_FIELDS = {
 }
 SAFE_TERM_RE = re.compile(r"^[\w*~.-]+$", re.ASCII)
 
-_CLASSIFIED_CSV = os.path.join(
-    os.path.dirname(__file__), "mega_ai_posts_comments_classified.csv"
+_PREDICTIONS_CSV = os.path.join(
+    os.path.dirname(__file__), "final_reddit_dataset_with_predictions.csv"
 )
 
 
 def _load_subreddit_options(csv_path: str) -> list[str]:
-    """Return distinct subreddit values from the classified CSV, sorted case-insensitively."""
+    """Return distinct subreddit values from the predictions CSV, sorted case-insensitively."""
     seen: set[str] = set()
     try:
         with open(csv_path, newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
-                val = (row.get("Subreddit the post/comment is from") or "").strip()
+                val = (row.get("subreddit") or "").strip().lstrip("r/")
                 if val:
                     seen.add(val)
     except FileNotFoundError:
-        logger.warning("Classified CSV not found at %s; subreddit dropdown will be empty.", csv_path)
-    return sorted(seen, key=lambda s: s.lstrip("r/").lower())
+        logger.warning("Predictions CSV not found at %s; subreddit dropdown will be empty.", csv_path)
+    return sorted(seen, key=lambda s: s.lower())
 
 
-SUBREDDIT_OPTIONS: list[str] = _load_subreddit_options(_CLASSIFIED_CSV)
+SUBREDDIT_OPTIONS: list[str] = _load_subreddit_options(_PREDICTIONS_CSV)
 
 # Module-level service singletons (created once at import time).
 _embedder = EmbeddingClient()
@@ -66,7 +66,7 @@ _hybrid   = HybridSearchService(SOLR_URL, _embedder, _reranker)
 
 
 def _build_fq(doc_type, subreddit, date_from, date_to,
-              polarity, subjectivity, source_dataset, model, vendor):
+              polarity, subjectivity, sarcasm, source_dataset, model, vendor):
     fq = []
     if doc_type:
         fq.append(f"type:{doc_type}")
@@ -80,6 +80,8 @@ def _build_fq(doc_type, subreddit, date_from, date_to,
         fq.append(f"polarity_label:{polarity}")
     if subjectivity:
         fq.append(f"subjectivity_label:{subjectivity}")
+    if sarcasm:
+        fq.append(f"sarcasm_label:{sarcasm}")
     if source_dataset:
         fq.append(f"source_dataset:{source_dataset}")
     if model:
@@ -233,6 +235,7 @@ def index() -> str:
     sort           = request.args.get("sort", "score desc")
     polarity       = request.args.get("polarity", "")
     subjectivity   = request.args.get("subjectivity", "")
+    sarcasm        = request.args.get("sarcasm", "")
     source_dataset = request.args.get("source_dataset", "")
     model          = request.args.get("model", "")
     vendor         = request.args.get("vendor", "")
@@ -267,6 +270,7 @@ def index() -> str:
                 sort=sort,
                 polarity=polarity,
                 subjectivity=subjectivity,
+                sarcasm=sarcasm,
                 source_dataset=source_dataset,
                 model=model,
                 vendor=vendor,
@@ -306,7 +310,7 @@ def index() -> str:
                 error = f"NLP enhancement failed ({type(exc).__name__}: {exc}). Falling back to basic search."
 
         fq = _build_fq(doc_type, subreddit, date_from, date_to,
-                       polarity, subjectivity, source_dataset, model, vendor)
+                       polarity, subjectivity, sarcasm, source_dataset, model, vendor)
 
         # Build query-field weights:
         #   - search_text for combined retrieval
@@ -418,6 +422,7 @@ def index() -> str:
         sort=sort,
         polarity=polarity,
         subjectivity=subjectivity,
+        sarcasm=sarcasm,
         source_dataset=source_dataset,
         model=model,
         vendor=vendor,
