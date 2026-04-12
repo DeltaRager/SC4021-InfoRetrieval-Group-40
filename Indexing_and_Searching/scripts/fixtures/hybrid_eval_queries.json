@@ -1,0 +1,77 @@
+{
+  "query_groups": [
+    {
+      "category": "keyword",
+      "description": "Exact and literal queries that favor BM25 term matching.",
+      "queries": [
+        "ChatGPT reviews",
+        "Claude AI opinions",
+        "Gemini AI feedback",
+        "GPT-4 performance review",
+        "LLM hallucination issues",
+        "AI chatbot accuracy problems",
+        "ChatGPT pricing complaints",
+        "Claude safety features review",
+        "ChatGPT vs Claude",
+        "worst AI tools",
+        "AI coding assistant review",
+        "ChatGPT coding ability",
+        "LLM bias issues",
+        "AI job replacement concerns"
+      ]
+    },
+    {
+      "category": "semantic",
+      "description": "Natural-language and intent-oriented queries that should benefit from embeddings.",
+      "queries": [
+        "Is ChatGPT actually useful for real work?",
+        "Do people trust AI chatbots?",
+        "Which AI model gives the most accurate answers?",
+        "Are LLMs reliable for coding tasks?",
+        "Why do people complain about hallucinations in AI?",
+        "Which AI is safest to use?",
+        "Are AI tools worth paying for?",
+        "What do users think about Claude compared to GPT?",
+        "Is Gemini better than ChatGPT?",
+        "Do AI models make too many mistakes?",
+        "Are people satisfied with current AI technology?",
+        "What frustrates users the most about AI chatbots?",
+        "Do developers like using AI tools?",
+        "Is AI helping productivity or making things worse?",
+        "Are AI responses trustworthy?"
+      ]
+    },
+    {
+      "category": "comparative",
+      "description": "Multi-entity comparison queries that stress aggregation across brands and models.",
+      "queries": [
+        "ChatGPT vs Claude which is better",
+        "Claude vs Gemini differences",
+        "GPT-4 vs GPT-3.5 user opinions",
+        "Which AI is best for coding",
+        "Which AI is most accurate",
+        "Which LLM is safest",
+        "ChatGPT vs Gemini for students",
+        "Claude vs ChatGPT for writing",
+        "Which AI hallucinates the most",
+        "Best AI assistant for productivity"
+      ]
+    },
+    {
+      "category": "aspect",
+      "description": "Aspect-based opinion queries for fine-grained strengths, weaknesses, and complaints.",
+      "queries": [
+        "ChatGPT accuracy issues",
+        "Claude safety vs usefulness",
+        "Gemini performance problems",
+        "AI hallucination complaints",
+        "AI bias and fairness concerns",
+        "AI impact on jobs",
+        "AI coding strengths and weaknesses",
+        "AI pricing value for money",
+        "AI usability and user experience",
+        "AI reliability in real-world usage"
+      ]
+    }
+  ]
+}
