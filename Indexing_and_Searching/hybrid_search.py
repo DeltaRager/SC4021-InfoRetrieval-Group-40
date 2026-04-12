@@ -1133,13 +1133,14 @@ class HybridSearchService:
 
         Returns a structured dict with sections:
           ``overview``            total_docs, date_span, avg_score
-          ``sentiment``           polarity/subjectivity totals + time series
+          ``sentiment``           polarity/subjectivity/sarcasm totals + time series
           ``by_subreddit``        top-N subreddit counts + sentiment mix
           ``by_model``            top-N model counts + sentiment mix
           ``by_vendor``           top-N vendor counts + sentiment mix
           ``by_type``             post vs comment volume + sentiment mix
           ``score_bands``         fixed score ranges + polarity split
-          ``confidence_bands``    polarity/subjectivity confidence distributions
+          ``sarcasm_totals``      sarcasm label counts (sarcastic, non_sarcastic, unknown)
+          ``sarcasm_series``      sarcasm label counts per time bucket
           ``total_docs_analysed`` total unique docs matched (convenience top-level key)
           legacy flat keys for backwards compatibility with existing template code
         On any Solr error returns an empty dict so callers can degrade gracefully.
@@ -1161,6 +1162,7 @@ class HybridSearchService:
 
         polarity_labels     = ["positive", "negative", "neutral", "mixed"]
         subjectivity_labels = ["subjective", "objective"]
+        sarcasm_labels      = ["sarcastic", "non_sarcastic"]
 
         # Nested polarity breakdown reused under each grouped facet
         _nested_polarity = {
@@ -1190,6 +1192,11 @@ class HybridSearchService:
                 "limit": -1, "mincount": 0, "missing": True,
                 "facet": {"docs": "unique(doc_id)"},
             },
+            "sarcasm_totals": {
+                "type": "terms", "field": "sarcasm_label",
+                "limit": -1, "mincount": 0, "missing": True,
+                "facet": {"docs": "unique(doc_id)"},
+            },
             # Time series
             "by_date": {
                 "type": "range", "field": "created_date",
@@ -1199,6 +1206,11 @@ class HybridSearchService:
                     "polarity":     dict(_nested_polarity),
                     "subjectivity": {
                         "type": "terms", "field": "subjectivity_label",
+                        "limit": -1, "mincount": 0, "missing": True,
+                        "facet": {"docs": "unique(doc_id)"},
+                    },
+                    "sarcasm": {
+                        "type": "terms", "field": "sarcasm_label",
                         "limit": -1, "mincount": 0, "missing": True,
                         "facet": {"docs": "unique(doc_id)"},
                     },
@@ -1237,19 +1249,6 @@ class HybridSearchService:
                     "docs": "unique(doc_id)",
                     "polarity": dict(_nested_polarity),
                 },
-            },
-            # Confidence distributions (no nesting needed — just term counts)
-            "polarity_confidence_bins": {
-                "type": "range", "field": "polarity_confidence",
-                "start": 0.0, "end": 1.0, "gap": 0.1,
-                "mincount": 1,
-                "facet": {"docs": "unique(doc_id)"},
-            },
-            "subjectivity_confidence_bins": {
-                "type": "range", "field": "subjectivity_confidence",
-                "start": 0.0, "end": 1.0, "gap": 0.1,
-                "mincount": 1,
-                "facet": {"docs": "unique(doc_id)"},
             },
         }, separators=(",", ":"))
 
@@ -1348,22 +1347,6 @@ class HybridSearchService:
             return result
 
         # ----------------------------------------------------------------
-        # Helper: extract confidence bin data from a range facet node.
-        # Returns {labels: [...], counts: [...]}
-        # ----------------------------------------------------------------
-        def _extract_confidence_bins(facet_node: Any) -> dict[str, Any]:
-            if not isinstance(facet_node, dict):
-                return {"labels": [], "counts": []}
-            labels: list[str] = []
-            counts: list[int] = []
-            for bucket in facet_node.get("buckets", []):
-                lo = bucket.get("val", 0.0)
-                count = int(bucket.get("docs", bucket.get("count", 0)) or 0)
-                labels.append(f"{lo:.1f}–{lo+0.1:.1f}")
-                counts.append(count)
-            return {"labels": labels, "counts": counts}
-
-        # ----------------------------------------------------------------
         # Scalars
         # ----------------------------------------------------------------
         total_docs: int = int(facets.get("total_unique_docs", 0) or 0)
@@ -1377,6 +1360,7 @@ class HybridSearchService:
         # ----------------------------------------------------------------
         polarity_totals     = _extract_totals(facets.get("polarity_totals"),     polarity_labels)
         subjectivity_totals = _extract_totals(facets.get("subjectivity_totals"), subjectivity_labels)
+        sarcasm_totals      = _extract_totals(facets.get("sarcasm_totals"),      sarcasm_labels)
 
         # ----------------------------------------------------------------
         # Time series
@@ -1388,6 +1372,7 @@ class HybridSearchService:
         volume_series: list[int] = []
         polarity_series: dict[str, list[int]] = {lbl: [] for lbl in polarity_labels + ["unknown"]}
         subjectivity_series: dict[str, list[int]] = {lbl: [] for lbl in subjectivity_labels + ["unknown"]}
+        sarcasm_series: dict[str, list[int]] = {lbl: [] for lbl in sarcasm_labels + ["unknown"]}
 
         for bucket in date_buckets_raw:
             date_val = bucket.get("val", "")
@@ -1431,6 +1416,23 @@ class HybridSearchService:
             for lbl in subjectivity_series:
                 subjectivity_series[lbl].append(subj_counts.get(lbl, 0))
 
+            sarc_node = bucket.get("sarcasm", {})
+            sarc_counts: dict[str, int] = {lbl: 0 for lbl in sarcasm_labels + ["unknown"]}
+            for sc in (sarc_node.get("buckets", []) if isinstance(sarc_node, dict) else []):
+                lbl = str(sc.get("val", "")).strip().lower()
+                cnt = int(sc.get("docs", sc.get("count", 0)) or 0)
+                if lbl in sarc_counts:
+                    sarc_counts[lbl] = cnt
+                else:
+                    sarc_counts["unknown"] += cnt
+            missing_sarc = int(
+                (sarc_node.get("missing") or {}).get("docs",
+                (sarc_node.get("missing") or {}).get("count", 0)) or 0
+            ) if isinstance(sarc_node, dict) else 0
+            sarc_counts["unknown"] += missing_sarc
+            for lbl in sarcasm_series:
+                sarcasm_series[lbl].append(sarc_counts.get(lbl, 0))
+
         # ----------------------------------------------------------------
         # Grouped breakdowns
         # ----------------------------------------------------------------
@@ -1439,19 +1441,15 @@ class HybridSearchService:
         by_vendor    = _extract_grouped(facets.get("by_vendor"),    self._VENDOR_TOP_N)
         by_type      = _extract_grouped(facets.get("by_type"),      20)  # type has few values
 
-        # ----------------------------------------------------------------
-        # Confidence distributions
-        # ----------------------------------------------------------------
-        pol_conf_bins  = _extract_confidence_bins(facets.get("polarity_confidence_bins"))
-        subj_conf_bins = _extract_confidence_bins(facets.get("subjectivity_confidence_bins"))
-
         return {
             # Legacy flat keys (backwards compat — template still uses these)
             "time_buckets":         time_buckets,
             "polarity_series":      polarity_series,
             "subjectivity_series":  subjectivity_series,
+            "sarcasm_series":       sarcasm_series,
             "polarity_totals":      polarity_totals,
             "subjectivity_totals":  subjectivity_totals,
+            "sarcasm_totals":       sarcasm_totals,
             "total_docs_analysed":  total_docs,
             # New structured sections
             "overview": {
@@ -1463,19 +1461,17 @@ class HybridSearchService:
             "sentiment": {
                 "polarity_totals":      polarity_totals,
                 "subjectivity_totals":  subjectivity_totals,
+                "sarcasm_totals":       sarcasm_totals,
                 "time_buckets":         time_buckets,
                 "volume_series":        volume_series,
                 "polarity_series":      polarity_series,
                 "subjectivity_series":  subjectivity_series,
+                "sarcasm_series":       sarcasm_series,
             },
             "by_subreddit": by_subreddit,
             "by_model":     by_model,
             "by_vendor":    by_vendor,
             "by_type":      by_type,
-            "confidence_bands": {
-                "polarity":     pol_conf_bins,
-                "subjectivity": subj_conf_bins,
-            },
         }
 
     # Keep the old name as an alias for callers that haven't migrated yet.

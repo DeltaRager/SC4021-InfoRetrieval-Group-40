@@ -258,8 +258,8 @@ class TestHybridSearchService:
              "search_text": f"text {i}", "body": f"body {i}",
              "title": "", "type": "post", "subreddit": "test",
              "source_dataset": "test", "polarity_label": "neutral",
-             "polarity_confidence": 0.0, "model_mentions": [], "vendor_mentions": [],
-             "subjectivity_label": "unknown", "subjectivity_confidence": 0.0,
+             "model_mentions": [], "vendor_mentions": [],
+             "subjectivity_label": "unknown", "sarcasm_label": "unknown",
              "score": 1, "created_date": ""}
             for i in ids
         ]
@@ -560,8 +560,8 @@ class TestVectorModeSortSemantics:
                 "search_text": f"text {eid}", "body": f"body {eid}",
                 "title": "", "type": "post", "subreddit": "test",
                 "source_dataset": "test", "polarity_label": "neutral",
-                "polarity_confidence": 0.0, "model_mentions": [], "vendor_mentions": [],
-                "subjectivity_label": "unknown", "subjectivity_confidence": 0.0,
+                "model_mentions": [], "vendor_mentions": [],
+                "subjectivity_label": "unknown", "sarcasm_label": "unknown",
                 "score": 1, "created_date": date,
             })
         return docs
@@ -1127,9 +1127,8 @@ class TestChunkCollapse:
             "subreddit": "test",
             "source_dataset": "test",
             "polarity_label": "neutral",
-            "polarity_confidence": 0.0,
             "subjectivity_label": "unknown",
-            "subjectivity_confidence": 0.0,
+            "sarcasm_label": "unknown",
             "model_mentions": [],
             "vendor_mentions": [],
             "score": score,
@@ -1904,8 +1903,8 @@ class TestIntentIntegration:
              "chunk_text": f"chunk text {i}", "search_text": f"text {i}",
              "body": f"body {i}", "title": "", "type": "post", "subreddit": "test",
              "source_dataset": "test", "polarity_label": "neutral",
-             "polarity_confidence": 0.0, "model_mentions": [], "vendor_mentions": [],
-             "subjectivity_label": "unknown", "subjectivity_confidence": 0.0,
+             "model_mentions": [], "vendor_mentions": [],
+             "subjectivity_label": "unknown", "sarcasm_label": "unknown",
              "score": 1, "created_date": ""}
             for i in ids
         ]
@@ -2060,37 +2059,47 @@ def _make_solr_analytics_payload(
     total_unique_docs=10,
     polarity_buckets=None,
     subjectivity_buckets=None,
+    sarcasm_buckets=None,
     date_buckets=None,
     polarity_missing_count=0,
     subjectivity_missing_count=0,
+    sarcasm_missing_count=0,
     subreddit_buckets=None,
     model_buckets=None,
     vendor_buckets=None,
     type_buckets=None,
-    pol_conf_bins=None,
-    subj_conf_bins=None,
     avg_score=None,
     min_date=None,
     max_date=None,
 ):
     """Build a minimal Solr JSON Facet response for analytics tests."""
-    polarity_buckets = polarity_buckets or [
-        {"val": "positive", "docs": 4},
-        {"val": "negative", "docs": 3},
-        {"val": "neutral",  "docs": 2},
-        {"val": "mixed",    "docs": 1},
-    ]
-    subjectivity_buckets = subjectivity_buckets or [
-        {"val": "subjective", "docs": 6},
-        {"val": "objective",  "docs": 3},
-    ]
-    date_buckets = date_buckets or []
-    subreddit_buckets = subreddit_buckets or []
-    model_buckets = model_buckets or []
-    vendor_buckets = vendor_buckets or []
-    type_buckets = type_buckets or []
-    pol_conf_bins = pol_conf_bins or []
-    subj_conf_bins = subj_conf_bins or []
+    if polarity_buckets is None:
+        polarity_buckets = [
+            {"val": "positive", "docs": 4},
+            {"val": "negative", "docs": 3},
+            {"val": "neutral",  "docs": 2},
+            {"val": "mixed",    "docs": 1},
+        ]
+    if subjectivity_buckets is None:
+        subjectivity_buckets = [
+            {"val": "subjective", "docs": 6},
+            {"val": "objective",  "docs": 3},
+        ]
+    if sarcasm_buckets is None:
+        sarcasm_buckets = [
+            {"val": "sarcastic",     "docs": 4},
+            {"val": "non_sarcastic", "docs": 5},
+        ]
+    if date_buckets is None:
+        date_buckets = []
+    if subreddit_buckets is None:
+        subreddit_buckets = []
+    if model_buckets is None:
+        model_buckets = []
+    if vendor_buckets is None:
+        vendor_buckets = []
+    if type_buckets is None:
+        type_buckets = []
 
     return {
         "facets": {
@@ -2107,6 +2116,10 @@ def _make_solr_analytics_payload(
                 "buckets": subjectivity_buckets,
                 "missing": {"docs": subjectivity_missing_count},
             },
+            "sarcasm_totals": {
+                "buckets": sarcasm_buckets,
+                "missing": {"docs": sarcasm_missing_count},
+            },
             "by_date": {
                 "buckets": date_buckets,
             },
@@ -2114,8 +2127,6 @@ def _make_solr_analytics_payload(
             "by_model":     {"buckets": model_buckets},
             "by_vendor":    {"buckets": vendor_buckets},
             "by_type":      {"buckets": type_buckets},
-            "polarity_confidence_bins":     {"buckets": pol_conf_bins},
-            "subjectivity_confidence_bins": {"buckets": subj_conf_bins},
         }
     }
 
@@ -2145,7 +2156,8 @@ class TestSentimentAnalyticsParsing:
         result = self._run(_make_solr_analytics_payload())
         legacy_keys = {
             "time_buckets", "polarity_series", "subjectivity_series",
-            "polarity_totals", "subjectivity_totals", "total_docs_analysed",
+            "sarcasm_series", "polarity_totals", "subjectivity_totals",
+            "sarcasm_totals", "total_docs_analysed",
         }
         assert legacy_keys.issubset(set(result.keys()))
 
@@ -2520,8 +2532,10 @@ class TestAppAnalyticsRoute:
             "time_buckets": ["2024-01"],
             "polarity_series": {"positive": [3], "negative": [1], "neutral": [1], "mixed": [0], "unknown": [0]},
             "subjectivity_series": {"subjective": [4], "objective": [1], "unknown": [0]},
+            "sarcasm_series": {"sarcastic": [2], "non_sarcastic": [3], "unknown": [0]},
             "polarity_totals": {"positive": 3, "negative": 1, "neutral": 1, "mixed": 0, "unknown": 0},
             "subjectivity_totals": {"subjective": 4, "objective": 1, "unknown": 0},
+            "sarcasm_totals": {"sarcastic": 2, "non_sarcastic": 3, "unknown": 0},
             "total_docs_analysed": 5,
         })
 
@@ -2593,17 +2607,9 @@ def _make_analytics_payload_full():
             {"val": "comment", "docs": 6,
              "polarity": {"buckets": [{"val":"neutral","docs":4},{"val":"positive","docs":2}],  "missing":{"docs":0}}},
         ],
-        pol_conf_bins=[
-            {"val": 0.5, "docs": 4},
-            {"val": 0.6, "docs": 6},
-            {"val": 0.7, "docs": 5},
-            {"val": 0.8, "docs": 3},
-            {"val": 0.9, "docs": 2},
-        ],
-        subj_conf_bins=[
-            {"val": 0.6, "docs": 8},
-            {"val": 0.7, "docs": 7},
-            {"val": 0.8, "docs": 5},
+        sarcasm_buckets=[
+            {"val": "sarcastic",     "docs": 7},
+            {"val": "non_sarcastic", "docs": 11},
         ],
     )
 
@@ -2753,46 +2759,101 @@ class TestAnalyticsDashboardParsing:
         assert type_map["post"] == 14
         assert type_map["comment"] == 6
 
-    # ---- confidence_bands ----
+    # ---- sarcasm_totals ----
 
-    def test_confidence_bands_present(self):
+    def test_sarcasm_totals_present(self):
         result = self._run(_make_analytics_payload_full())
-        assert "confidence_bands" in result
-        assert "polarity" in result["confidence_bands"]
-        assert "subjectivity" in result["confidence_bands"]
+        assert "sarcasm_totals" in result
+        assert "sarcastic" in result["sarcasm_totals"]
+        assert "non_sarcastic" in result["sarcasm_totals"]
+        assert "unknown" in result["sarcasm_totals"]
 
-    def test_confidence_bands_polarity_bins(self):
+    def test_sarcasm_totals_correct(self):
         result = self._run(_make_analytics_payload_full())
-        pol = result["confidence_bands"]["polarity"]
-        assert len(pol["labels"]) == 5
-        assert len(pol["counts"]) == 5
-        assert pol["counts"][0] == 4  # first bin: val=0.5, docs=4
+        assert result["sarcasm_totals"]["sarcastic"] == 7
+        assert result["sarcasm_totals"]["non_sarcastic"] == 11
+        assert result["sarcasm_totals"]["unknown"] == 0
 
-    def test_confidence_bands_subjectivity_bins(self):
-        result = self._run(_make_analytics_payload_full())
-        subj = result["confidence_bands"]["subjectivity"]
-        assert len(subj["labels"]) == 3
-        assert subj["counts"] == [8, 7, 5]
-
-    def test_confidence_band_label_format(self):
-        result = self._run(_make_analytics_payload_full())
-        pol = result["confidence_bands"]["polarity"]
-        # Each label should be a range string like "0.5–0.6"
-        for lbl in pol["labels"]:
-            assert "–" in lbl
-
-    def test_confidence_bands_empty_when_no_data(self):
-        payload = _make_solr_analytics_payload(pol_conf_bins=[], subj_conf_bins=[])
+    def test_sarcasm_missing_counted_as_unknown(self):
+        payload = _make_solr_analytics_payload(
+            sarcasm_buckets=[{"val": "sarcastic", "docs": 3}],
+            sarcasm_missing_count=5,
+        )
         result = self._run(payload)
-        assert result["confidence_bands"]["polarity"]["labels"] == []
-        assert result["confidence_bands"]["subjectivity"]["counts"] == []
+        assert result["sarcasm_totals"]["sarcastic"] == 3
+        assert result["sarcasm_totals"]["unknown"] == 5
+
+    def test_sarcasm_unrecognised_label_goes_to_unknown(self):
+        payload = _make_solr_analytics_payload(
+            sarcasm_buckets=[{"val": "weird_label", "docs": 4}]
+        )
+        result = self._run(payload)
+        assert result["sarcasm_totals"]["unknown"] == 4
+
+    def test_sarcasm_zero_when_no_sarcasm_data(self):
+        payload = _make_solr_analytics_payload(sarcasm_buckets=[], sarcasm_missing_count=0)
+        result = self._run(payload)
+        assert result["sarcasm_totals"]["sarcastic"] == 0
+        assert result["sarcasm_totals"]["non_sarcastic"] == 0
+        assert result["sarcasm_totals"]["unknown"] == 0
+
+    # ---- sarcasm_series ----
+
+    def test_sarcasm_series_present(self):
+        result = self._run(_make_analytics_payload_full())
+        assert "sarcasm_series" in result
+
+    def test_sarcasm_series_parallel_to_time_buckets(self):
+        date_buckets = [
+            {
+                "val": f"2024-0{m}-01T00:00:00Z",
+                "sarcasm": {
+                    "buckets": [{"val": "sarcastic", "docs": m}],
+                    "missing": {"docs": 0},
+                },
+            }
+            for m in range(1, 4)
+        ]
+        result = self._run(_make_solr_analytics_payload(date_buckets=date_buckets))
+        n = len(result["time_buckets"])
+        assert n == 3
+        for lbl, series in result["sarcasm_series"].items():
+            assert len(series) == n, f"sarcasm_series[{lbl!r}] length mismatch"
+
+    def test_sarcasm_series_values_correct(self):
+        date_buckets = [
+            {
+                "val": "2024-01-01T00:00:00Z",
+                "sarcasm": {
+                    "buckets": [{"val": "sarcastic", "docs": 3}, {"val": "non_sarcastic", "docs": 5}],
+                    "missing": {"docs": 1},
+                },
+            },
+            {
+                "val": "2024-02-01T00:00:00Z",
+                "sarcasm": {
+                    "buckets": [{"val": "non_sarcastic", "docs": 7}],
+                    "missing": {"docs": 0},
+                },
+            },
+        ]
+        result = self._run(_make_solr_analytics_payload(date_buckets=date_buckets))
+        assert result["sarcasm_series"]["sarcastic"]     == [3, 0]
+        assert result["sarcasm_series"]["non_sarcastic"] == [5, 7]
+        assert result["sarcasm_series"]["unknown"]       == [1, 0]
+
+    # ---- no confidence_bands in output ----
+
+    def test_confidence_bands_not_in_result(self):
+        result = self._run(_make_analytics_payload_full())
+        assert "confidence_bands" not in result
 
     # ---- new structured keys alongside legacy keys ----
 
     def test_new_sections_present(self):
         result = self._run(_make_analytics_payload_full())
         for key in ("overview", "sentiment", "by_subreddit", "by_model",
-                    "by_vendor", "by_type", "confidence_bands"):
+                    "by_vendor", "by_type", "sarcasm_totals", "sarcasm_series"):
             assert key in result, f"Missing section: {key}"
 
     def test_legacy_keys_still_present(self):

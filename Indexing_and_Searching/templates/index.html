@@ -88,9 +88,11 @@
     .atc-negative    { background: #ffebee; color: #b71c1c; }
     .atc-neutral     { background: #f5f5f5; color: #555; border: 1px solid #ddd; }
     .atc-mixed       { background: #fff3e0; color: #e65100; }
-    .atc-subjective  { background: #fff8e1; color: #f57f17; }
-    .atc-objective   { background: #e8eaf6; color: #283593; }
-    .atc-unknown     { background: #fafafa; color: #aaa; border: 1px solid #eee; }
+    .atc-subjective     { background: #fff8e1; color: #f57f17; }
+    .atc-objective      { background: #e8eaf6; color: #283593; }
+    .atc-sarcastic      { background: #f3e8ff; color: #7e22ce; }
+    .atc-non_sarcastic  { background: #e0f2fe; color: #0284c7; }
+    .atc-unknown        { background: #fafafa; color: #aaa; border: 1px solid #eee; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
@@ -316,6 +318,12 @@
           {% for lbl, cnt in analytics.polarity_totals.items() %}
             {% if cnt %}<div class="overview-card"><div class="ov-val">{{ cnt }}</div><div class="ov-lbl analytics-total-chip atc-{{ lbl }}" style="padding:0;background:none;border:none;">{{ lbl }}</div></div>{% endif %}
           {% endfor %}
+          {% for lbl, cnt in analytics.subjectivity_totals.items() %}
+            {% if cnt %}<div class="overview-card"><div class="ov-val">{{ cnt }}</div><div class="ov-lbl analytics-total-chip atc-{{ lbl }}" style="padding:0;background:none;border:none;">{{ lbl }}</div></div>{% endif %}
+          {% endfor %}
+          {% for lbl, cnt in analytics.sarcasm_totals.items() %}
+            {% if cnt %}<div class="overview-card"><div class="ov-val">{{ cnt }}</div><div class="ov-lbl analytics-total-chip atc-{{ lbl }}" style="padding:0;background:none;border:none;">{{ lbl | replace('_', ' ') }}</div></div>{% endif %}
+          {% endfor %}
         </div>
       </div>
 
@@ -433,21 +441,23 @@
       </div>
       {% endif %}
 
-      {# ---- Confidence distributions ---- #}
-      {% if analytics.confidence_bands %}
+      {# ---- Sarcasm ---- #}
+      {% if analytics.sarcasm_totals %}
       <div class="dash-section">
-        <div class="dash-section-title">Sentiment Confidence</div>
+        <div class="dash-section-title">Sarcasm</div>
         <div class="charts-grid">
           <div class="chart-card">
-            <h3>Polarity confidence</h3>
-            <span class="chart-sub">Distribution of polarity confidence scores</span>
-            <canvas id="chartPolConf" height="150"></canvas>
+            <h3>Sarcasm distribution</h3>
+            <span class="chart-sub">All matched documents</span>
+            <canvas id="chartSarcasmDist" height="160"></canvas>
           </div>
+          {% if analytics.time_buckets | length >= 2 %}
           <div class="chart-card">
-            <h3>Subjectivity confidence</h3>
-            <span class="chart-sub">Distribution of subjectivity confidence scores</span>
-            <canvas id="chartSubjConf" height="150"></canvas>
+            <h3>Sarcasm trend over time</h3>
+            <span class="chart-sub">Sarcasm label counts per time bucket</span>
+            <canvas id="chartSarcasmTrend" height="160"></canvas>
           </div>
+          {% endif %}
         </div>
       </div>
       {% endif %}
@@ -483,13 +493,15 @@
 
       // --- colour palettes ---
       var POL = {
-        positive:   { bg: "rgba(46,125,50,0.78)",   border: "#2e7d32" },
-        negative:   { bg: "rgba(183,28,28,0.78)",   border: "#b71c1c" },
-        neutral:    { bg: "rgba(117,117,117,0.62)", border: "#757575" },
-        mixed:      { bg: "rgba(230,81,0,0.78)",    border: "#e65100" },
-        subjective: { bg: "rgba(245,127,23,0.78)",  border: "#f57f17" },
-        objective:  { bg: "rgba(40,53,147,0.78)",   border: "#283593" },
-        unknown:    { bg: "rgba(200,200,200,0.5)",  border: "#bdbdbd" },
+        positive:     { bg: "rgba(46,125,50,0.78)",   border: "#2e7d32" },
+        negative:     { bg: "rgba(183,28,28,0.78)",   border: "#b71c1c" },
+        neutral:      { bg: "rgba(117,117,117,0.62)", border: "#757575" },
+        mixed:        { bg: "rgba(230,81,0,0.78)",    border: "#e65100" },
+        subjective:   { bg: "rgba(245,127,23,0.78)",  border: "#f57f17" },
+        objective:    { bg: "rgba(40,53,147,0.78)",   border: "#283593" },
+        sarcastic:    { bg: "rgba(126,34,206,0.78)",  border: "#7e22ce" },
+        non_sarcastic:{ bg: "rgba(2,132,199,0.78)",   border: "#0284c7" },
+        unknown:      { bg: "rgba(200,200,200,0.5)",  border: "#bdbdbd" },
       };
       // Volume / neutral bar palette (rotates across buckets)
       var VOL_COLORS = [
@@ -646,20 +658,33 @@
       drawGrouped("chartTypeVol",      "chartTypeSentiment",      A.by_type);
 
       // -----------------------------------------------------------------------
-      // Confidence distributions
+      // Sarcasm distribution & trend
       // -----------------------------------------------------------------------
       (function(){
-        var cb = A.confidence_bands || {};
-        var polConf  = cb.polarity     || {};
-        var subjConf = cb.subjectivity || {};
-        if (polConf.labels  && polConf.labels.length)
-          simpleBar("chartPolConf",  polConf.labels,  polConf.counts,
-            polConf.labels.map(function(){return "rgba(99,102,241,0.72)";}),
-            polConf.labels.map(function(){return "#6366f1";}));
-        if (subjConf.labels && subjConf.labels.length)
-          simpleBar("chartSubjConf", subjConf.labels, subjConf.counts,
-            subjConf.labels.map(function(){return "rgba(14,165,233,0.72)";}),
-            subjConf.labels.map(function(){return "#0ea5e9";}));
+        var sarcT = (A.sentiment || A).sarcasm_totals || A.sarcasm_totals || {};
+        var sarcL=[], sarcD=[], sarcBg=[], sarcBo=[];
+        ["sarcastic","non_sarcastic","unknown"].forEach(function(lbl){
+          var v = sarcT[lbl]||0; if(!v) return;
+          sarcL.push(lbl === "non_sarcastic" ? "Non-sarcastic" : cap(lbl));
+          sarcD.push(v);
+          sarcBg.push(polC(lbl,"bg")); sarcBo.push(polC(lbl,"border"));
+        });
+        simpleBar("chartSarcasmDist", sarcL, sarcD, sarcBg, sarcBo);
+
+        if (timeBuckets.length >= 2) {
+          var sarcSeries = (A.sentiment || A).sarcasm_series || A.sarcasm_series || {};
+          var sarcDs = [];
+          [["sarcastic","Sarcastic"],["non_sarcastic","Non-sarcastic"],["unknown","Unknown"]].forEach(function(pair){
+            var lbl = pair[0], name = pair[1];
+            var data = sarcSeries[lbl] || [];
+            if (data.reduce(function(a,b){return a+b;},0) === 0) return;
+            sarcDs.push({ label: name, data: data,
+              borderColor: polC(lbl,"border"), backgroundColor: polC(lbl,"bg"),
+              tension: 0.3, fill: false,
+              pointRadius: timeBuckets.length > 60 ? 0 : 3 });
+          });
+          lineChart("chartSarcasmTrend", timeBuckets, sarcDs);
+        }
       })();
     }
   })();
