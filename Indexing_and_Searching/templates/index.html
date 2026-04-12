@@ -34,7 +34,9 @@
     .nlp-panel { background: #e8f5e9; border: 1px solid #c8e6c9; border-radius: 8px; padding: 12px; margin: 12px 0; font-size: 0.92em; }
     .nlp-panel b { color: #2e7d32; }
     .nlp-label { display: inline-block; min-width: 140px; font-weight: 600; color: #555; }
-    .concept-tag { display: inline-block; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 4px; padding: 2px 8px; margin: 2px 3px; font-size: 0.88em; color: #1565c0; }
+    .concept-tag { display: inline-block; background: #e3f2fd; border: 1px solid #90caf9; border-radius: 4px; padding: 2px 8px; margin: 2px 3px; font-size: 0.88em; color: #1565c0; cursor: pointer; }
+    .concept-tag:hover { background: #bbdefb; border-color: #42a5f5; }
+    .concept-tag:focus { outline: 2px solid #1565c0; outline-offset: 1px; }
     .doc-concepts { margin-top: 6px; }
     .nlp-toggle { font-size: 0.88em; color: #666; margin-bottom: 10px; }
     .auto-corrected { background: #e3f2fd; border: 1px solid #90caf9; border-radius: 8px; padding: 10px 14px; margin: 10px 0; font-size: 0.95em; color: #1565c0; }
@@ -93,6 +95,12 @@
     .atc-sarcastic      { background: #f3e8ff; color: #7e22ce; }
     .atc-non_sarcastic  { background: #e0f2fe; color: #0284c7; }
     .atc-unknown        { background: #fafafa; color: #aaa; border: 1px solid #eee; }
+    /* Concept analytics loading/error states */
+    .analytics-loading { display: none; text-align: center; padding: 32px 0; color: #6b7280; font-size: 0.9em; }
+    .analytics-loading.active { display: block; }
+    .analytics-error { display: none; text-align: center; padding: 16px; color: #b71c1c; font-size: 0.88em; background: #ffebee; border-radius: 6px; margin: 12px 0; }
+    .analytics-error.active { display: block; }
+    .analytics-mode-label { font-size: 0.75em; font-weight: 600; color: #7c3aed; background: #ede9fe; border-radius: 10px; padding: 2px 9px; margin-left: 8px; vertical-align: middle; }
   </style>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 </head>
@@ -103,7 +111,7 @@
       {% for concept in items[:limit] %}
         {% set trimmed = concept|trim %}
         {% if trimmed %}
-          <span class="concept-tag">{{ trimmed }}</span>
+          <button class="concept-tag" type="button" data-concept="{{ trimmed }}" title="View analytics for &ldquo;{{ trimmed }}&rdquo;">{{ trimmed }}</button>
         {% endif %}
       {% endfor %}
     {% endif %}
@@ -291,297 +299,285 @@
   <div class="analytics-overlay" id="analyticsOverlay" role="dialog" aria-modal="true" aria-label="Analytics Dashboard">
     <div class="analytics-popover">
       <div class="analytics-popover-header">
-        <h2>Analytics Dashboard &mdash; {{ analytics.total_docs_analysed }} document{{ 's' if analytics.total_docs_analysed != 1 }}</h2>
+        <h2 id="analyticsDashTitle">Analytics Dashboard &mdash; {{ analytics.total_docs_analysed }} document{{ 's' if analytics.total_docs_analysed != 1 }}</h2>
         <button class="analytics-close" id="analyticsCloseBtn" type="button" aria-label="Close">&times;</button>
       </div>
+      <div class="analytics-loading" id="analyticsLoading">Loading concept analytics&hellip;</div>
+      <div class="analytics-error" id="analyticsError"></div>
 
-      {# ---- Overview cards ---- #}
-      <div class="dash-section">
-        <div class="dash-section-title">Overview</div>
-        <div class="overview-cards">
-          <div class="overview-card">
-            <div class="ov-val">{{ analytics.total_docs_analysed }}</div>
-            <div class="ov-lbl">Matched documents</div>
-          </div>
-          {% if analytics.overview and analytics.overview.min_date %}
-          <div class="overview-card">
-            <div class="ov-val" style="font-size:1em;">{{ analytics.overview.min_date }} &ndash; {{ analytics.overview.max_date or '?' }}</div>
-            <div class="ov-lbl">Date span</div>
-          </div>
-          {% endif %}
-          {% if analytics.overview and analytics.overview.avg_score is not none %}
-          <div class="overview-card">
-            <div class="ov-val">{{ '%.1f'|format(analytics.overview.avg_score) }}</div>
-            <div class="ov-lbl">Avg Reddit score</div>
-          </div>
-          {% endif %}
-          {% for lbl, cnt in analytics.polarity_totals.items() %}
-            {% if cnt %}<div class="overview-card"><div class="ov-val">{{ cnt }}</div><div class="ov-lbl analytics-total-chip atc-{{ lbl }}" style="padding:0;background:none;border:none;">{{ lbl }}</div></div>{% endif %}
-          {% endfor %}
-          {% for lbl, cnt in analytics.subjectivity_totals.items() %}
-            {% if cnt %}<div class="overview-card"><div class="ov-val">{{ cnt }}</div><div class="ov-lbl analytics-total-chip atc-{{ lbl }}" style="padding:0;background:none;border:none;">{{ lbl }}</div></div>{% endif %}
-          {% endfor %}
-          {% for lbl, cnt in analytics.sarcasm_totals.items() %}
-            {% if cnt %}<div class="overview-card"><div class="ov-val">{{ cnt }}</div><div class="ov-lbl analytics-total-chip atc-{{ lbl }}" style="padding:0;background:none;border:none;">{{ lbl | replace('_', ' ') }}</div></div>{% endif %}
-          {% endfor %}
-        </div>
-      </div>
-
-      {# ---- Time-series row ---- #}
-      <div class="dash-section">
-        <div class="dash-section-title">Volume &amp; Sentiment over Time</div>
-        {% if analytics.time_buckets | length >= 2 %}
-        <div class="charts-grid">
-          <div class="chart-card full-width">
-            <h3>Volume over time</h3>
-            <span class="chart-sub">Documents matched per time bucket</span>
-            <canvas id="chartVolumeTrend" height="90"></canvas>
-          </div>
-          <div class="chart-card full-width">
-            <h3>Polarity trend over time</h3>
-            <span class="chart-sub">Sentiment label counts per time bucket</span>
-            <canvas id="chartPolarityTrend" height="100"></canvas>
-          </div>
-        </div>
-        {% else %}
-        <p class="analytics-empty">Insufficient time data for trend charts (need &ge; 2 buckets).</p>
-        {% endif %}
-      </div>
-
-      {# ---- Sentiment distribution row ---- #}
-      <div class="dash-section">
-        <div class="dash-section-title">Sentiment Distribution</div>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <h3>Polarity distribution</h3>
-            <span class="chart-sub">All matched documents</span>
-            <canvas id="chartPolarityDist" height="160"></canvas>
-          </div>
-          <div class="chart-card">
-            <h3>Subjectivity distribution</h3>
-            <span class="chart-sub">All matched documents</span>
-            <canvas id="chartSubjectivityDist" height="160"></canvas>
-          </div>
-        </div>
-      </div>
-
-      {# ---- Subreddit comparison ---- #}
-      {% if analytics.by_subreddit | length >= 2 %}
-      <div class="dash-section">
-        <div class="dash-section-title">By Subreddit</div>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <h3>Top subreddits</h3>
-            <span class="chart-sub">Top {{ analytics.by_subreddit | length }} subreddits in matched documents</span>
-            <canvas id="chartSubredditVol" height="180"></canvas>
-          </div>
-          <div class="chart-card">
-            <h3>Subreddit sentiment mix</h3>
-            <span class="chart-sub">Polarity split per subreddit (stacked)</span>
-            <canvas id="chartSubredditSentiment" height="180"></canvas>
-          </div>
-        </div>
-      </div>
-      {% endif %}
-
-      {# ---- Post vs Comment ---- #}
-      {% if analytics.by_type | length >= 2 %}
-      <div class="dash-section">
-        <div class="dash-section-title">Post vs Comment</div>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <h3>Type volume</h3>
-            <span class="chart-sub">Posts vs comments in matched documents</span>
-            <canvas id="chartTypeVol" height="150"></canvas>
-          </div>
-          <div class="chart-card">
-            <h3>Type sentiment mix</h3>
-            <span class="chart-sub">Polarity split per content type</span>
-            <canvas id="chartTypeSentiment" height="150"></canvas>
-          </div>
-        </div>
-      </div>
-      {% endif %}
-
-      {# ---- Model comparison (show only when enough data) ---- #}
-      {% if analytics.by_model | length >= 2 %}
-      <div class="dash-section">
-        <div class="dash-section-title">By AI Model</div>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <h3>Top models</h3>
-            <span class="chart-sub">Top {{ analytics.by_model | length }} models mentioned in matched documents</span>
-            <canvas id="chartModelVol" height="180"></canvas>
-          </div>
-          <div class="chart-card">
-            <h3>Model sentiment mix</h3>
-            <span class="chart-sub">Polarity split per model</span>
-            <canvas id="chartModelSentiment" height="180"></canvas>
-          </div>
-        </div>
-      </div>
-      {% endif %}
-
-      {# ---- Vendor comparison (show only when enough data) ---- #}
-      {% if analytics.by_vendor | length >= 2 %}
-      <div class="dash-section">
-        <div class="dash-section-title">By Vendor</div>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <h3>Top vendors</h3>
-            <span class="chart-sub">Top {{ analytics.by_vendor | length }} vendors mentioned in matched documents</span>
-            <canvas id="chartVendorVol" height="160"></canvas>
-          </div>
-          <div class="chart-card">
-            <h3>Vendor sentiment mix</h3>
-            <span class="chart-sub">Polarity split per vendor</span>
-            <canvas id="chartVendorSentiment" height="160"></canvas>
-          </div>
-        </div>
-      </div>
-      {% endif %}
-
-      {# ---- Sarcasm ---- #}
-      {% if analytics.sarcasm_totals %}
-      <div class="dash-section">
-        <div class="dash-section-title">Sarcasm</div>
-        <div class="charts-grid">
-          <div class="chart-card">
-            <h3>Sarcasm distribution</h3>
-            <span class="chart-sub">All matched documents</span>
-            <canvas id="chartSarcasmDist" height="160"></canvas>
-          </div>
-          {% if analytics.time_buckets | length >= 2 %}
-          <div class="chart-card">
-            <h3>Sarcasm trend over time</h3>
-            <span class="chart-sub">Sarcasm label counts per time bucket</span>
-            <canvas id="chartSarcasmTrend" height="160"></canvas>
-          </div>
-          {% endif %}
-        </div>
-      </div>
-      {% endif %}
-
+      <div id="analyticsDashContent">
+      </div>{# end analyticsDashContent — populated at runtime by renderAnalyticsContent() #}
     </div>{# end analytics-popover #}
   </div>
 
   <script>
   (function() {
-    var overlay  = document.getElementById("analyticsOverlay");
-    var openBtn  = document.getElementById("analyticsOpenBtn");
-    var closeBtn = document.getElementById("analyticsCloseBtn");
-    var chartsInitialised = false;
+    var overlay    = document.getElementById("analyticsOverlay");
+    var openBtn    = document.getElementById("analyticsOpenBtn");
+    var closeBtn   = document.getElementById("analyticsCloseBtn");
+    var titleEl    = document.getElementById("analyticsDashTitle");
+    var loadingEl  = document.getElementById("analyticsLoading");
+    var errorEl    = document.getElementById("analyticsError");
+    var contentEl  = document.getElementById("analyticsDashContent");
 
-    function openPopover() {
-      overlay.classList.add("open");
-      if (!chartsInitialised) { chartsInitialised = true; initCharts(); }
+    // The server-rendered analytics payload (search-wide mode).
+    var SEARCH_ANALYTICS = {{ analytics | tojson }};
+
+    // Registry of Chart.js instances so we can destroy them before re-rendering.
+    var _chartInstances = [];
+
+    // -----------------------------------------------------------------------
+    // Colour palettes (shared by both modes)
+    // -----------------------------------------------------------------------
+    var POL = {
+      positive:     { bg: "rgba(46,125,50,0.78)",   border: "#2e7d32" },
+      negative:     { bg: "rgba(183,28,28,0.78)",   border: "#b71c1c" },
+      neutral:      { bg: "rgba(117,117,117,0.62)", border: "#757575" },
+      mixed:        { bg: "rgba(230,81,0,0.78)",    border: "#e65100" },
+      subjective:   { bg: "rgba(245,127,23,0.78)",  border: "#f57f17" },
+      objective:    { bg: "rgba(40,53,147,0.78)",   border: "#283593" },
+      sarcastic:    { bg: "rgba(126,34,206,0.78)",  border: "#7e22ce" },
+      non_sarcastic:{ bg: "rgba(2,132,199,0.78)",   border: "#0284c7" },
+      unknown:      { bg: "rgba(200,200,200,0.5)",  border: "#bdbdbd" },
+    };
+    var VOL_COLORS = [
+      "rgba(99,102,241,0.72)","rgba(14,165,233,0.72)","rgba(16,185,129,0.72)",
+      "rgba(234,179,8,0.72)", "rgba(249,115,22,0.72)","rgba(168,85,247,0.72)",
+      "rgba(236,72,153,0.72)","rgba(20,184,166,0.72)",
+    ];
+    var VOL_BORDERS = VOL_COLORS.map(function(c){return c.replace("0.72","1");});
+
+    function polC(lbl, prop) { return (POL[lbl] || POL.unknown)[prop]; }
+    function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+    // -----------------------------------------------------------------------
+    // Chart factory helpers — each registers the instance for later cleanup
+    // -----------------------------------------------------------------------
+    function simpleBar(id, labels, data, bgs, borders, opts) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var chart = new Chart(el, {
+        type: "bar",
+        data: { labels: labels, datasets: [{ label: "Documents", data: data,
+          backgroundColor: bgs, borderColor: borders, borderWidth: 1 }] },
+        options: Object.assign({ responsive: true,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+        }, opts || {}),
+      });
+      _chartInstances.push(chart);
     }
-    function closePopover() { overlay.classList.remove("open"); }
 
-    openBtn.addEventListener("click", openPopover);
-    closeBtn.addEventListener("click", closePopover);
-    overlay.addEventListener("click", function(e) { if (e.target === overlay) closePopover(); });
-    document.addEventListener("keydown", function(e) {
-      if (e.key === "Escape" && overlay.classList.contains("open")) closePopover();
-    });
+    function stackedBar(id, labels, polDatasets, opts) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var chart = new Chart(el, {
+        type: "bar",
+        data: { labels: labels, datasets: polDatasets },
+        options: Object.assign({ responsive: true,
+          plugins: { legend: { position: "top", labels: { boxWidth: 12, font: { size: 11 } } } },
+          scales: {
+            x: { stacked: true, ticks: { font: { size: 11 } } },
+            y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } },
+          },
+        }, opts || {}),
+      });
+      _chartInstances.push(chart);
+    }
+
+    function lineChart(id, labels, datasets, opts) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      var chart = new Chart(el, {
+        type: "line",
+        data: { labels: labels, datasets: datasets },
+        options: Object.assign({ responsive: true,
+          plugins: { legend: { position: "top", labels: { boxWidth: 12, font: { size: 11 } } },
+                      tooltip: { mode: "index", intersect: false } },
+          scales: {
+            x: { ticks: { maxTicksLimit: 12, maxRotation: 45, font: { size: 10 } } },
+            y: { beginAtZero: true, ticks: { precision: 0 } },
+          },
+        }, opts || {}),
+      });
+      _chartInstances.push(chart);
+    }
+
+    function groupedStackedDatasets(grouped) {
+      var labels = grouped.map(function(g){ return g.label; });
+      var polKeys = ["positive","negative","neutral","mixed","unknown"];
+      var datasets = [];
+      polKeys.forEach(function(pk){
+        var data = grouped.map(function(g){ return (g.polarity_mix || {})[pk] || 0; });
+        var total = data.reduce(function(a,b){return a+b;},0);
+        if (total === 0) return;
+        datasets.push({
+          label: cap(pk), data: data,
+          backgroundColor: polC(pk,"bg"), borderColor: polC(pk,"border"), borderWidth: 1,
+        });
+      });
+      return { labels: labels, datasets: datasets };
+    }
 
     // -----------------------------------------------------------------------
-    // Chart helpers
+    // DOM builder — rebuilds the entire overlay body from the active payload A
     // -----------------------------------------------------------------------
-    function initCharts() {
-      var A = {{ analytics | tojson }};
+    function h(tag, attrs, inner) {
+      var el = document.createElement(tag);
+      Object.keys(attrs || {}).forEach(function(k) { el.setAttribute(k, attrs[k]); });
+      if (inner !== undefined) el.innerHTML = inner;
+      return el;
+    }
 
-      // --- colour palettes ---
-      var POL = {
-        positive:     { bg: "rgba(46,125,50,0.78)",   border: "#2e7d32" },
-        negative:     { bg: "rgba(183,28,28,0.78)",   border: "#b71c1c" },
-        neutral:      { bg: "rgba(117,117,117,0.62)", border: "#757575" },
-        mixed:        { bg: "rgba(230,81,0,0.78)",    border: "#e65100" },
-        subjective:   { bg: "rgba(245,127,23,0.78)",  border: "#f57f17" },
-        objective:    { bg: "rgba(40,53,147,0.78)",   border: "#283593" },
-        sarcastic:    { bg: "rgba(126,34,206,0.78)",  border: "#7e22ce" },
-        non_sarcastic:{ bg: "rgba(2,132,199,0.78)",   border: "#0284c7" },
-        unknown:      { bg: "rgba(200,200,200,0.5)",  border: "#bdbdbd" },
-      };
-      // Volume / neutral bar palette (rotates across buckets)
-      var VOL_COLORS = [
-        "rgba(99,102,241,0.72)","rgba(14,165,233,0.72)","rgba(16,185,129,0.72)",
-        "rgba(234,179,8,0.72)", "rgba(249,115,22,0.72)","rgba(168,85,247,0.72)",
-        "rgba(236,72,153,0.72)","rgba(20,184,166,0.72)",
+    function chartCard(id, title, sub, height) {
+      var card = h("div", {"class": "chart-card"});
+      card.appendChild(h("h3", {}, title));
+      card.appendChild(h("span", {"class": "chart-sub"}, sub));
+      card.appendChild(h("canvas", {"id": id, "height": String(height)}));
+      return card;
+    }
+
+    function chartCardFullWidth(id, title, sub, height) {
+      var card = chartCard(id, title, sub, height);
+      card.className = "chart-card full-width";
+      return card;
+    }
+
+    function renderAnalyticsContent(A) {
+      if (!contentEl) return;
+      contentEl.innerHTML = "";
+
+      var totalDocs = A.total_docs_analysed || 0;
+      var ov = A.overview || {};
+      var polT = (A.sentiment || A).polarity_totals || A.polarity_totals || {};
+      var subjT = (A.sentiment || A).subjectivity_totals || A.subjectivity_totals || {};
+      var sarcT = (A.sentiment || A).sarcasm_totals || A.sarcasm_totals || {};
+      var timeBuckets = (A.sentiment || A).time_buckets || A.time_buckets || [];
+      var bySub = A.by_subreddit || [];
+      var byType = A.by_type || [];
+      var byModel = A.by_model || [];
+      var byVendor = A.by_vendor || [];
+
+      // ---- Overview cards ----
+      var ovSec = h("div", {"class": "dash-section"});
+      ovSec.appendChild(h("div", {"class": "dash-section-title"}, "Overview"));
+      var cards = h("div", {"class": "overview-cards"});
+
+      function ovCard(val, lbl, valStyle) {
+        var card = h("div", {"class": "overview-card"});
+        var valEl = h("div", {"class": "ov-val"});
+        if (valStyle) valEl.setAttribute("style", valStyle);
+        valEl.textContent = val;
+        card.appendChild(valEl);
+        card.appendChild(h("div", {"class": "ov-lbl"}, lbl));
+        return card;
+      }
+
+      cards.appendChild(ovCard(totalDocs, "Matched documents"));
+      if (ov.min_date) {
+        cards.appendChild(ovCard((ov.min_date || "") + " – " + (ov.max_date || "?"), "Date span", "font-size:1em;"));
+      }
+      if (ov.avg_score != null) {
+        cards.appendChild(ovCard(parseFloat(ov.avg_score).toFixed(1), "Avg Reddit score"));
+      }
+      var labelGroups = [
+        { totals: polT, keys: ["positive","negative","neutral","mixed","unknown"] },
+        { totals: subjT, keys: ["subjective","objective","unknown"] },
+        { totals: sarcT, keys: ["sarcastic","non_sarcastic","unknown"] },
       ];
-      var VOL_BORDERS = VOL_COLORS.map(function(c){return c.replace("0.72","1");});
-
-      function polC(lbl, prop) { return (POL[lbl] || POL.unknown)[prop]; }
-      function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
-
-      // --- tiny chart factory helpers ---
-      function simpleBar(id, labels, data, bgs, borders, opts) {
-        var el = document.getElementById(id);
-        if (!el) return;
-        new Chart(el, {
-          type: "bar",
-          data: { labels: labels, datasets: [{ label: "Documents", data: data,
-            backgroundColor: bgs, borderColor: borders, borderWidth: 1 }] },
-          options: Object.assign({ responsive: true,
-            plugins: { legend: { display: false } },
-            scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
-          }, opts || {}),
+      labelGroups.forEach(function(g) {
+        g.keys.forEach(function(lbl) {
+          var cnt = g.totals[lbl] || 0;
+          if (!cnt) return;
+          var card = h("div", {"class": "overview-card"});
+          card.appendChild(h("div", {"class": "ov-val"}, String(cnt)));
+          var lblEl = h("div", {"class": "ov-lbl analytics-total-chip atc-" + lbl});
+          lblEl.setAttribute("style", "padding:0;background:none;border:none;");
+          lblEl.textContent = lbl.replace(/_/g, " ");
+          card.appendChild(lblEl);
+          cards.appendChild(card);
         });
+      });
+      ovSec.appendChild(cards);
+      contentEl.appendChild(ovSec);
+
+      // ---- Time-series row ----
+      var tsSec = h("div", {"class": "dash-section"});
+      tsSec.appendChild(h("div", {"class": "dash-section-title"}, "Volume &amp; Sentiment over Time"));
+      if (timeBuckets.length >= 2) {
+        var tsGrid = h("div", {"class": "charts-grid"});
+        tsGrid.appendChild(chartCardFullWidth("chartVolumeTrend", "Volume over time", "Documents matched per time bucket", 90));
+        tsGrid.appendChild(chartCardFullWidth("chartPolarityTrend", "Polarity trend over time", "Sentiment label counts per time bucket", 100));
+        tsSec.appendChild(tsGrid);
+      } else {
+        tsSec.appendChild(h("p", {"class": "analytics-empty"}, "Insufficient time data for trend charts (need ≥ 2 buckets)."));
+      }
+      contentEl.appendChild(tsSec);
+
+      // ---- Sentiment distribution row ----
+      var sentSec = h("div", {"class": "dash-section"});
+      sentSec.appendChild(h("div", {"class": "dash-section-title"}, "Sentiment Distribution"));
+      var sentGrid = h("div", {"class": "charts-grid"});
+      sentGrid.appendChild(chartCard("chartPolarityDist", "Polarity distribution", "All matched documents", 160));
+      sentGrid.appendChild(chartCard("chartSubjectivityDist", "Subjectivity distribution", "All matched documents", 160));
+      sentSec.appendChild(sentGrid);
+      contentEl.appendChild(sentSec);
+
+      // ---- Grouped section helper ----
+      function groupedSection(title, grouped, volId, sentId, volSub, sentSub, height) {
+        if (!grouped || grouped.length < 2) return;
+        var sec = h("div", {"class": "dash-section"});
+        sec.appendChild(h("div", {"class": "dash-section-title"}, title));
+        var grid = h("div", {"class": "charts-grid"});
+        grid.appendChild(chartCard(volId, "Top " + title.toLowerCase(), volSub, height));
+        grid.appendChild(chartCard(sentId, title + " sentiment mix", sentSub, height));
+        sec.appendChild(grid);
+        contentEl.appendChild(sec);
       }
 
-      function stackedBar(id, labels, polDatasets, opts) {
-        var el = document.getElementById(id);
-        if (!el) return;
-        new Chart(el, {
-          type: "bar",
-          data: { labels: labels, datasets: polDatasets },
-          options: Object.assign({ responsive: true,
-            plugins: { legend: { position: "top", labels: { boxWidth: 12, font: { size: 11 } } } },
-            scales: {
-              x: { stacked: true, ticks: { font: { size: 11 } } },
-              y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } },
-            },
-          }, opts || {}),
-        });
-      }
+      groupedSection("By Subreddit", bySub, "chartSubredditVol", "chartSubredditSentiment",
+        "Top " + bySub.length + " subreddits in matched documents",
+        "Polarity split per subreddit (stacked)", 180);
 
-      function lineChart(id, labels, datasets, opts) {
-        var el = document.getElementById(id);
-        if (!el) return;
-        new Chart(el, {
-          type: "line",
-          data: { labels: labels, datasets: datasets },
-          options: Object.assign({ responsive: true,
-            plugins: { legend: { position: "top", labels: { boxWidth: 12, font: { size: 11 } } },
-                        tooltip: { mode: "index", intersect: false } },
-            scales: {
-              x: { ticks: { maxTicksLimit: 12, maxRotation: 45, font: { size: 10 } } },
-              y: { beginAtZero: true, ticks: { precision: 0 } },
-            },
-          }, opts || {}),
-        });
-      }
+      groupedSection("Post vs Comment", byType, "chartTypeVol", "chartTypeSentiment",
+        "Posts vs comments in matched documents",
+        "Polarity split per content type", 150);
 
-      // Build stacked-bar datasets from a grouped breakdown list [{label,count,polarity_mix}]
-      function groupedStackedDatasets(grouped) {
-        var labels = grouped.map(function(g){ return g.label; });
-        var polKeys = ["positive","negative","neutral","mixed","unknown"];
-        var datasets = [];
-        polKeys.forEach(function(pk){
-          var data = grouped.map(function(g){ return (g.polarity_mix || {})[pk] || 0; });
-          var total = data.reduce(function(a,b){return a+b;},0);
-          if (total === 0) return;
-          datasets.push({
-            label: cap(pk), data: data,
-            backgroundColor: polC(pk,"bg"), borderColor: polC(pk,"border"), borderWidth: 1,
-          });
-        });
-        return { labels: labels, datasets: datasets };
-      }
+      groupedSection("By AI Model", byModel, "chartModelVol", "chartModelSentiment",
+        "Top " + byModel.length + " models mentioned in matched documents",
+        "Polarity split per model", 180);
 
-      // -----------------------------------------------------------------------
+      groupedSection("By Vendor", byVendor, "chartVendorVol", "chartVendorSentiment",
+        "Top " + byVendor.length + " vendors mentioned in matched documents",
+        "Polarity split per vendor", 160);
+
+      // ---- Sarcasm ----
+      var hasSarc = Object.keys(sarcT).some(function(k) { return sarcT[k] > 0; });
+      if (hasSarc) {
+        var sarcSec = h("div", {"class": "dash-section"});
+        sarcSec.appendChild(h("div", {"class": "dash-section-title"}, "Sarcasm"));
+        var sarcGrid = h("div", {"class": "charts-grid"});
+        sarcGrid.appendChild(chartCard("chartSarcasmDist", "Sarcasm distribution", "All matched documents", 160));
+        if (timeBuckets.length >= 2) {
+          sarcGrid.appendChild(chartCard("chartSarcasmTrend", "Sarcasm trend over time", "Sarcasm label counts per time bucket", 160));
+        }
+        sarcSec.appendChild(sarcGrid);
+        contentEl.appendChild(sarcSec);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Core chart renderer — works for both modes given any analytics payload A
+    // -----------------------------------------------------------------------
+    function destroyCharts() {
+      _chartInstances.forEach(function(c){ try { c.destroy(); } catch(e){} });
+      _chartInstances = [];
+    }
+
+    function renderCharts(A) {
+      destroyCharts();
+
       // Volume over time
-      // -----------------------------------------------------------------------
       var timeBuckets = (A.sentiment || A).time_buckets || A.time_buckets || [];
       var volSeries   = (A.sentiment || {}).volume_series || [];
       if (timeBuckets.length >= 2) {
@@ -593,8 +589,6 @@
                          y: { beginAtZero: true, ticks: { precision: 0 } } } }
           );
         }
-
-        // Polarity trend line
         var polSeries = (A.sentiment || A).polarity_series || A.polarity_series || {};
         var trendDs = [];
         ["positive","negative","neutral","mixed"].forEach(function(lbl){
@@ -608,9 +602,7 @@
         lineChart("chartPolarityTrend", timeBuckets, trendDs);
       }
 
-      // -----------------------------------------------------------------------
       // Polarity & Subjectivity distribution
-      // -----------------------------------------------------------------------
       (function(){
         var polT = (A.sentiment || A).polarity_totals || A.polarity_totals || {};
         var polL=[], polD=[], polBg=[], polBo=[];
@@ -631,9 +623,7 @@
         simpleBar("chartSubjectivityDist", subL, subD, subBg, subBo);
       })();
 
-      // -----------------------------------------------------------------------
-      // Grouped breakdowns: subreddit, model, vendor, type
-      // -----------------------------------------------------------------------
+      // Grouped breakdowns
       function drawGrouped(volId, sentId, grouped) {
         if (!grouped || grouped.length < 2) return;
         var labels = grouped.map(function(g){ return g.label; });
@@ -651,15 +641,12 @@
                        y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } } } }
         );
       }
-
       drawGrouped("chartSubredditVol", "chartSubredditSentiment", A.by_subreddit);
       drawGrouped("chartModelVol",     "chartModelSentiment",     A.by_model);
       drawGrouped("chartVendorVol",    "chartVendorSentiment",    A.by_vendor);
       drawGrouped("chartTypeVol",      "chartTypeSentiment",      A.by_type);
 
-      // -----------------------------------------------------------------------
       // Sarcasm distribution & trend
-      // -----------------------------------------------------------------------
       (function(){
         var sarcT = (A.sentiment || A).sarcasm_totals || A.sarcasm_totals || {};
         var sarcL=[], sarcD=[], sarcBg=[], sarcBo=[];
@@ -687,6 +674,84 @@
         }
       })();
     }
+
+    // -----------------------------------------------------------------------
+    // Overlay open / close
+    // -----------------------------------------------------------------------
+    function setLoading(on) {
+      if (loadingEl) loadingEl.classList.toggle("active", on);
+      if (contentEl) contentEl.style.display = on ? "none" : "";
+    }
+
+    function setError(msg) {
+      if (errorEl) {
+        if (msg) { errorEl.textContent = msg; errorEl.classList.add("active"); }
+        else { errorEl.textContent = ""; errorEl.classList.remove("active"); }
+      }
+      if (contentEl) contentEl.style.display = msg ? "none" : "";
+    }
+
+    function openSearchAnalytics() {
+      setLoading(false);
+      setError("");
+      if (titleEl) {
+        var n = SEARCH_ANALYTICS.total_docs_analysed || 0;
+        titleEl.innerHTML = "Analytics Dashboard &mdash; " + n + " document" + (n !== 1 ? "s" : "");
+      }
+      overlay.classList.add("open");
+      renderAnalyticsContent(SEARCH_ANALYTICS);
+      renderCharts(SEARCH_ANALYTICS);
+    }
+
+    function openConceptAnalytics(concept) {
+      setError("");
+      setLoading(true);
+      if (titleEl) {
+        titleEl.innerHTML = "Analytics Dashboard &mdash; concept: " +
+          "<span class=\"analytics-mode-label\">" + concept + "</span>";
+      }
+      overlay.classList.add("open");
+
+      fetch("/analytics/concept?concept=" + encodeURIComponent(concept))
+        .then(function(res) {
+          if (!res.ok) {
+            return res.json().then(function(body) {
+              throw new Error(body.error || ("Request failed: " + res.status));
+            });
+          }
+          return res.json();
+        })
+        .then(function(payload) {
+          setLoading(false);
+          renderAnalyticsContent(payload);
+          renderCharts(payload);
+        })
+        .catch(function(err) {
+          setLoading(false);
+          setError("Could not load concept analytics: " + err.message);
+        });
+    }
+
+    function closePopover() {
+      overlay.classList.remove("open");
+    }
+
+    if (openBtn) openBtn.addEventListener("click", openSearchAnalytics);
+    closeBtn.addEventListener("click", closePopover);
+    overlay.addEventListener("click", function(e) { if (e.target === overlay) closePopover(); });
+    document.addEventListener("keydown", function(e) {
+      if (e.key === "Escape" && overlay.classList.contains("open")) closePopover();
+    });
+
+    // Concept chip click delegation — works for chips rendered anywhere on the page.
+    document.addEventListener("click", function(e) {
+      var btn = e.target.closest
+        ? e.target.closest("button.concept-tag[data-concept]")
+        : (e.target.matches && e.target.matches("button.concept-tag[data-concept]") ? e.target : null);
+      if (!btn) return;
+      var concept = btn.getAttribute("data-concept");
+      if (concept) openConceptAnalytics(concept);
+    });
   })();
   </script>
   {% endif %}

@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 from typing import Any
 
 import requests
-from flask import Flask, render_template, request
+from flask import Flask, jsonify, render_template, request
 
 from nlp_utils import process_query
 from hybrid_search import (
@@ -438,6 +438,57 @@ def index() -> str:
         error=error,
         subreddit_options=SUBREDDIT_OPTIONS,
     )
+
+
+@app.get("/analytics/concept")
+def analytics_concept():
+    """Return an analytics payload scoped to a single concept value.
+
+    Query parameters
+    ----------------
+    concept   : str   – The concept to filter by (required, must be non-empty).
+    date_from : str   – Optional ISO date lower bound (YYYY-MM-DD).
+    date_to   : str   – Optional ISO date upper bound (YYYY-MM-DD).
+
+    Returns JSON in the same shape as the analytics dict embedded in the
+    index template so the overlay JS can render it without any changes to the
+    chart code.
+    """
+    concept   = request.args.get("concept", "").strip()
+    date_from = request.args.get("date_from", "")
+    date_to   = request.args.get("date_to", "")
+
+    if not concept:
+        return jsonify({"error": "concept parameter is required"}), 400
+
+    # Build a Solr filter query that restricts to documents whose concepts
+    # field contains the requested concept phrase.
+    concept_fq = f'concepts:"{concept}"'
+    fq = [concept_fq]
+    if date_from or date_to:
+        d_from = (date_from + "T00:00:00Z") if date_from else "*"
+        d_to   = (date_to   + "T23:59:59Z") if date_to   else "*"
+        fq.append(f"created_date:[{d_from} TO {d_to}]")
+
+    try:
+        payload = _hybrid.get_analytics(
+            solr_q="*:*",
+            fq=fq,
+            qf="",
+            pf="",
+            bq=[],
+            date_from=date_from,
+            date_to=date_to,
+            doc_ids=None,
+        )
+    except Exception as exc:
+        logger.warning("Concept analytics aggregation failed for %r: %s", concept, exc)
+        return jsonify({"error": "Analytics aggregation failed"}), 500
+
+    if not payload:
+        return jsonify({"error": "No data found for this concept"}), 404
+
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
