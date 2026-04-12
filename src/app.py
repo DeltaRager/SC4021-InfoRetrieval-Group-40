@@ -158,7 +158,7 @@ def _solr_setup_status(solr_url: str) -> tuple[bool, str]:
         missing = ", ".join(missing_fields)
         return False, (
             f"Solr core `{core_name}` is missing required schema fields: {missing}. "
-            "Apply `Indexing_and_Searching/schema_add_fields.json` and reindex the data."
+            "Apply `src/schema_add_fields.json` and reindex the data."
         )
 
     return True, ""

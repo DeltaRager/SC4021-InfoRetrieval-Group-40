@@ -116,7 +116,7 @@ def run_bench_solr(solr_url: str) -> None:
     spot_checks = [
         ("ChatGPT privacy", {"fq": "polarity_label:negative"}),
         ("Claude",          {"fq": "model_mentions:claude"}),
-        ("AI regulation",   {"fq": "source_dataset:mega_ai_posts_comments_classified"}),
+        ("AI regulation",   {"fq": "source_dataset:final_reddit_dataset_with_predictions"}),
     ]
     for q, extra in spot_checks:
         label = f"{q} [{extra.get('fq', '')}]"

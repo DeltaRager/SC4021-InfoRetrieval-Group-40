@@ -1,6 +1,9 @@
 # 3.2 Indexing (Solr)
 
-This folder contains a minimal reproducible pipeline for the SC4021 indexing task.
+This folder contains the Solr assets used by the canonical Flask search stack.
+
+The root `docker-compose.yml` mounts `src/solr/configs/` into the Solr
+container when it creates the `reddit_ai` core.
 
 ## 1) Start Solr
 
@@ -12,7 +15,6 @@ This repo standardizes the Flask search stack on the Solr core `reddit_ai`.
 
 ## 2) Create / update schema fields
 
-run on cmd: 
 ```bash
 curl -X POST -H "Content-type:application/json" http://localhost:8983/solr/reddit_ai/schema --data-binary "@schema_add_fields.json"
 ```
@@ -35,7 +37,6 @@ python -c "import json; from pathlib import Path; p=Path(r'data\reddit_docs.json
 ```
 
 ## 4) Index data into Solr
-run on cmd: 
 ```bash
 curl -X POST -H "Content-type:application/json" "http://localhost:8983/solr/reddit_ai/update?commit=true" --data-binary "@data\reddit_docs.json"
 ```

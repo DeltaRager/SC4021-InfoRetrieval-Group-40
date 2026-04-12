@@ -2,7 +2,7 @@
 Unit and integration tests for the hybrid BM25 + vector retrieval pipeline.
 
 Run with:
-    python -m pytest Indexing_and_Searching/tests/test_hybrid_search.py -v
+    python -m pytest src/tests/test_hybrid_search.py -v
 """
 
 import sys
@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# Make the Indexing_and_Searching directory importable
+# Make the src directory importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hybrid_search import (

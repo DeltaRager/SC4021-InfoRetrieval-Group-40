@@ -1,6 +1,0 @@
-id,type,parent_id,title,text,author,subreddit,created_utc,score,url
-"t3_1ab2c3d","post","","ChatGPT just passed the bar exam","I can't believe how fast AI is progressing. What does this mean for lawyers?","ai_fanatic","technology","1704067200",1540,"https://reddit.com/r/technology/comments/1ab2c3d"
-"t1_d9efg4h","comment","t3_1ab2c3d","","It’s impressive, but passing a multiple-choice test isn't the same as practicing law in court.","skeptic_lawyer","technology","1704070800",450,""
-"t1_d9efg5i","comment","t3_1ab2c3d","","I just use it to draft emails, and honestly it saves me 2 hours a day.","productivity_guru","technology","1704071200",320,""
-"t3_9xyz890","post","","Is Midjourney ruining digital art?","Every time I go on ArtStation now, it's flooded with AI generations. It feels like real artists are being pushed out.","tired_artist","Art","1705001200",890,"https://reddit.com/r/Art/comments/9xyz890"
-"t1_z8a9b1c","comment","t3_9xyz890","","I think it's just a new tool. Photography didn't kill painting, it just changed it.","tech_optimist","Art","1705004800",210,""

@@ -790,7 +790,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output", default="data/reddit_docs.jsonl",
-        help="Output JSONL path (relative to Indexing_and_Searching/)",
+        help="Output JSONL path (relative to src/)",
     )
     parser.add_argument(
         "--input",
@@ -799,7 +799,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # index_root is Indexing_and_Searching/
+    # index_root is src/
     index_root = Path(__file__).resolve().parents[1]
     output_path = index_root / args.output
 

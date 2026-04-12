@@ -1,7 +1,3 @@
-# Solr data
-solr/data/
-solr/logs/
-
 # Docker volumes
 docker-volumes/
 
@@ -24,17 +20,10 @@ __pycache__/
 *.pyo
 
 # Generated / large data files
-Indexing_and_Searching/data/missing_vectors.json
-Indexing_and_Searching/data/missing_bitcoin_backfill.json
-Indexing_and_Searching/data/reddit_docs.json
-Indexing_and_Searching/data/reddit_docs.jsonl
-Indexing_and_Searching/data/reddit_docs_ascii.json
-
-# Frontend dependencies
-ui/node_modules/
+src/data/
 
 # Dev changelogs
-Indexing_and_Searching/changelog/
+src/changelog/
 
 # Large CSV files
 *.csv
